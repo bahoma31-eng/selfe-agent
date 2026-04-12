@@ -10,7 +10,7 @@ on:
       model_index:
         description: 'رقم النموذج من models.txt (يبدأ من 1)'
         required: false
-        default: '2'
+        default: '1'
 
 jobs:
   run-agent:
@@ -30,39 +30,64 @@ jobs:
 
       - name: Run Selfe Agent (non-interactive)
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GROQ_API_KEY:     ${{ secrets.GROQ_API_KEY }}
+          MODEL_INDEX:      ${{ github.event.inputs.model_index }}
+          USER_MESSAGE:     ${{ github.event.inputs.message }}
         run: |
           python - <<'EOF'
           import os, sys
 
-          MODELS_FILE = "models.txt"
-          MODEL_INDEX = int(os.environ.get("MODEL_INDEX", "2")) - 1
-          MESSAGE     = os.environ.get("USER_MESSAGE", "مرحباً")
-          API_KEY     = os.environ.get("OPENAI_API_KEY", "")
+          PROVIDER_CONFIG = {
+              "gemini": {
+                  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                  "secret_vars": ["GEMINI_API_KEY_1","GEMINI_API_KEY_2",
+                                  "GEMINI_API_KEY_3","GEMINI_API_KEY_4"],
+              },
+              "groq": {
+                  "base_url": "https://api.groq.com/openai/v1",
+                  "secret_vars": ["GROQ_API_KEY"],
+              },
+          }
 
-          if not API_KEY:
-              print("[ERROR] OPENAI_API_KEY غير موجود في Secrets")
+          all_keys = {}
+          for p, cfg in PROVIDER_CONFIG.items():
+              all_keys[p] = [os.environ.get(v,"").strip() for v in cfg["secret_vars"] if os.environ.get(v,"").strip()]
+
+          with open("models.txt") as f:
+              models = []
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"): continue
+                  name, provider = (line.split("|",1) if "|" in line else (line, "gemini"))
+                  models.append({"name": name.strip(), "provider": provider.strip().lower()})
+
+          idx = int(os.environ.get("MODEL_INDEX","1")) - 1
+          model = models[idx] if idx < len(models) else models[0]
+          msg   = os.environ.get("USER_MESSAGE", "مرحباً")
+
+          pkeys = all_keys.get(model["provider"], [])
+          if not pkeys:
+              print(f"[ERROR] لا يوجد مفتاح للمزود: {model['provider']}")
               sys.exit(1)
 
-          with open(MODELS_FILE) as f:
-              models = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-
-          model = models[MODEL_INDEX] if MODEL_INDEX < len(models) else models[0]
-          print(f"النموذج: {model}")
-          print(f"الرسالة: {MESSAGE}")
+          print(f"النموذج : {model['name']}")
+          print(f"المزود  : {model['provider']}")
+          print(f"الرسالة : {msg}\n")
 
           from openai import OpenAI
-          client = OpenAI(api_key=API_KEY)
+          cfg = PROVIDER_CONFIG[model["provider"]]
+          client = OpenAI(api_key=pkeys[0], base_url=cfg["base_url"])
           resp = client.chat.completions.create(
-              model=model,
+              model=model["name"],
               messages=[
                   {"role": "system", "content": "أنت مساعد ذكاء اصطناعي مفيد."},
-                  {"role": "user",   "content": MESSAGE},
+                  {"role": "user",   "content": msg},
               ]
           )
-          print("\nرد النموذج:")
+          print("رد النموذج:")
           print(resp.choices[0].message.content)
           EOF
-        env:
-          MODEL_INDEX: ${{ github.event.inputs.model_index }}
-          USER_MESSAGE: ${{ github.event.inputs.message }}

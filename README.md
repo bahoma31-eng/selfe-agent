@@ -1,6 +1,6 @@
-# Selfe Agent 🤖
+# Selfe Agent 🤖 v2.0
 
-عميل ذكاء اصطناعي بسيط يقرأ المفتاح السري من GitHub Secrets وأسماء النماذج من ملف `models.txt`.
+عميل ذكاء اصطناعي يدعم **مفاتيح متعددة** مع تدوير تلقائي عند استنفاد الحصة.
 
 ---
 
@@ -8,56 +8,69 @@
 
 ```
 selfe-agent/
-├── agent.py          # السكريبت الرئيسي
-├── models.txt        # قائمة أسماء النماذج
-├── requirements.txt  # المكتبات المطلوبة
+├── agent.py                    # السكريبت الرئيسي
+├── models.txt                  # قائمة النماذج + المزود
+├── requirements.txt            # المكتبات المطلوبة
 └── .github/
     └── workflows/
-        └── run_agent.yml  # تشغيل عبر GitHub Actions
+        └── run_agent.yml       # تشغيل عبر GitHub Actions
 ```
 
 ---
 
-## ⚙️ الإعداد
-
-### 1. إضافة المفتاح السري
+## 🔑 المفاتيح السرية المطلوبة
 
 اذهب إلى: **Settings → Secrets and variables → Actions → New repository secret**
 
-| الاسم | القيمة |
-|-------|--------|
-| `OPENAI_API_KEY` | مفتاح API الخاص بك |
+| المتغير السري | المزود | الوصف |
+|---|---|---|
+| `GEMINI_API_KEY_1` | Google Gemini | المفتاح الأول |
+| `GEMINI_API_KEY_2` | Google Gemini | المفتاح الثاني |
+| `GEMINI_API_KEY_3` | Google Gemini | المفتاح الثالث |
+| `GEMINI_API_KEY_4` | Google Gemini | المفتاح الرابع |
+| `GROQ_API_KEY`     | Groq          | مفتاح Groq |
 
-### 2. تثبيت المكتبات (محلياً)
+> عند وصول أحد مفاتيح Gemini لحد الاستخدام، يتحول السكريبت تلقائياً للمفتاح التالي.
+
+---
+
+## ⚙️ تشغيل محلي
 
 ```bash
 pip install -r requirements.txt
-```
 
-### 3. تشغيل السكريبت محلياً
+export GEMINI_API_KEY_1="AIza..."
+export GEMINI_API_KEY_2="AIza..."
+export GEMINI_API_KEY_3="AIza..."
+export GEMINI_API_KEY_4="AIza..."
+export GROQ_API_KEY="gsk_..."
 
-```bash
-export OPENAI_API_KEY="sk-..."
 python agent.py
 ```
 
 ---
 
-## 🚀 التشغيل عبر GitHub Actions
+## 📝 تعديل قائمة النماذج
+
+افتح `models.txt` وأضف نماذج بهذه الصيغة:
+
+```
+aسم_النموذج | اسم_المزود
+```
+
+مثال:
+```
+gemini-2.0-flash       | gemini
+llama-3.3-70b-versatile | groq
+```
+
+المزودون المدعومون: `gemini` و `groq`
+
+---
+
+## 🚀 تشغيل عبر GitHub Actions
 
 1. اذهب إلى تبويب **Actions**
 2. اختر **Run Selfe Agent**
 3. اضغط **Run workflow**
-4. أدخل رسالتك ورقم النموذج
-
----
-
-## 📝 تعديل قائمة النماذج
-
-افتح ملف `models.txt` وأضف أو احذف أسماء النماذج (سطر واحد لكل نموذج):
-
-```
-gpt-4o
-gpt-4o-mini
-claude-3-5-sonnet-20241022
-```
+4. أدخل رسالتك ورقم النموذج المطلوب
