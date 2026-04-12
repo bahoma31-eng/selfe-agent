@@ -1,0 +1,68 @@
+name: Run Selfe Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'الرسالة التي تريد إرسالها للنموذج'
+        required: true
+        default: 'مرحباً، من أنت؟'
+      model_index:
+        description: 'رقم النموذج من models.txt (يبدأ من 1)'
+        required: false
+        default: '2'
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install openai
+
+      - name: Run Selfe Agent (non-interactive)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python - <<'EOF'
+          import os, sys
+
+          MODELS_FILE = "models.txt"
+          MODEL_INDEX = int(os.environ.get("MODEL_INDEX", "2")) - 1
+          MESSAGE     = os.environ.get("USER_MESSAGE", "مرحباً")
+          API_KEY     = os.environ.get("OPENAI_API_KEY", "")
+
+          if not API_KEY:
+              print("[ERROR] OPENAI_API_KEY غير موجود في Secrets")
+              sys.exit(1)
+
+          with open(MODELS_FILE) as f:
+              models = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+          model = models[MODEL_INDEX] if MODEL_INDEX < len(models) else models[0]
+          print(f"النموذج: {model}")
+          print(f"الرسالة: {MESSAGE}")
+
+          from openai import OpenAI
+          client = OpenAI(api_key=API_KEY)
+          resp = client.chat.completions.create(
+              model=model,
+              messages=[
+                  {"role": "system", "content": "أنت مساعد ذكاء اصطناعي مفيد."},
+                  {"role": "user",   "content": MESSAGE},
+              ]
+          )
+          print("\nرد النموذج:")
+          print(resp.choices[0].message.content)
+          EOF
+        env:
+          MODEL_INDEX: ${{ github.event.inputs.model_index }}
+          USER_MESSAGE: ${{ github.event.inputs.message }}
