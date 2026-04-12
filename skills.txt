@@ -1,0 +1,12 @@
+# ============================================================
+# ملف المهارات المتاحة
+# الصيغة: skill_name | raw_github_url
+# المهارة الأولى في القائمة تكون هي الافتراضية عند بدء التشغيل
+# أسطر التعليقات (#) تُتجاهل
+# ============================================================
+
+prompt-engineer | https://raw.githubusercontent.com/bahoma31-eng/autonomous-agent/main/skills/01-ai-and-agents/06-prompt-engineering/prompt-engineer/SKILL.md
+
+# أضف مهارات إضافية بنفس الصيغة:
+# code-reviewer   | https://raw.githubusercontent.com/.../SKILL.md
+# data-analyst    | https://raw.githubusercontent.com/.../SKILL.md

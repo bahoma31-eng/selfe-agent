@@ -2,16 +2,21 @@ import os
 import sys
 
 # =========================================================
-# Selfe Agent v2.1
+# Selfe Agent v3.0
 # يدعم مفاتيح متعددة:
 #   GEMINI_API_KEY_1 .. GEMINI_API_KEY_4  → نماذج Gemini
 #   GROQ_API_KEY                          → نماذج Groq
-# أسماء النماذج + المزود  →  models.txt
-# البرومبت الخاص بالوكيل  →  system_prompt.txt
+# النماذج     → models.txt
+# البرومبت    → system_prompt.txt  (افتراضي)
+# المهارات    → skills.txt  (جلب SKILL.md من GitHub)
 # =========================================================
+
+import re
+import urllib.request
 
 MODELS_FILE        = "models.txt"
 SYSTEM_PROMPT_FILE = "system_prompt.txt"
+SKILLS_FILE        = "skills.txt"
 
 DEFAULT_SYSTEM_PROMPT = "أنت مساعد ذكاء اصطناعي مفيد ودقيق."
 
@@ -33,65 +38,115 @@ PROVIDER_CONFIG = {
 _key_index: dict[str, int] = {p: 0 for p in PROVIDER_CONFIG}
 
 
-# ── تحميل البرومبت ─────────────────────────────────────────
-def load_system_prompt(filepath: str) -> str:
-    """
-    قراءة البرومبت من system_prompt.txt.
-    - تُتجاهل الأسطر الفارغة والتعليقات (#).
-    - إذا لم يوجد الملف، يستخدم البرومبت الافتراضي.
-    """
-    if not os.path.exists(filepath):
-        print(f"[تحذير] لم يُعثر على {filepath} — سيستخدم البرومبت الافتراضي.")
-        return DEFAULT_SYSTEM_PROMPT
+# ─────────────────────────────────────────────────────────────
+# جلب SKILL.md من GitHub
+# ─────────────────────────────────────────────────────────────
 
+def load_skills(filepath: str) -> dict[str, str]:
+    """
+    قراءة skills.txt وإعادة قاموس {skill_name: url}.
+    الصيغة: skill_name | raw_github_url
+    """
+    skills: dict[str, str] = {}
+    if not os.path.exists(filepath):
+        return skills
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "|" in line:
+                name, url = [p.strip() for p in line.split("|", 1)]
+                skills[name.lower()] = url
+    return skills
+
+
+def fetch_skill(url: str) -> str:
+    """
+    جلب محتوى SKILL.md من raw GitHub URL.
+    يستخدم urllib (بدون مكتبات خارجية).
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "selfe-agent/3.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode("utf-8")
+    except Exception as e:
+        return ""
+
+
+def activate_skill(skill_name: str, skills: dict[str, str],
+                   history: list[dict]) -> tuple[str, list[dict]]:
+    """
+    تفعيل مهارة — جلب SKILL.md وضبطه كـ system message.
+    تُعيد تاريخ المحادثة مع البرومبت الجديد.
+    """
+    key = skill_name.lower().strip()
+    if key not in skills:
+        available = ", ".join(skills.keys()) or "لا يوجد"
+        return (
+            f"[خطأ] المهارة '{skill_name}' غير موجودة.\n"
+            f"المهارات المتاحة: {available}",
+            history
+        )
+
+    url = skills[key]
+    print(f"[جلب] جاري جلب SKILL.md من:\n  {url}")
+    content = fetch_skill(url)
+
+    if not content:
+        return f"[خطأ] تعذّر جلب المهارة من الرابط.\nتحقّق من صحة الرابط في skills.txt", history
+
+    # ضبط البرومبت الجديد وإعادة التاريخ
+    new_history = [{"role": "system", "content": content}]
+    msg = (
+        f"[تم] تفعيل المهارة \033[1m{key}\033[0m ✔\n"
+        f"  حجم المهارة: {len(content):,} حرف\n"
+        f"  المحادثة السابقة أُعيدت تحضيرها بالسياق الجديد."
+    )
+    return msg, new_history
+
+
+# ─────────────────────────────────────────────────────────────
+# بقية الدوال (keys, models, prompt, chat)
+# ─────────────────────────────────────────────────────────────
+
+def load_system_prompt(filepath: str) -> str:
+    if not os.path.exists(filepath):
+        return DEFAULT_SYSTEM_PROMPT
     lines = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
-            stripped = line.strip()
-            # تخطّي التعليقات
-            if stripped.startswith("#"):
-                continue
-            lines.append(line.rstrip())
-
+            if not line.strip().startswith("#"):
+                lines.append(line.rstrip())
     prompt = "\n".join(lines).strip()
-
-    if not prompt:
-        print(f"[تحذير] الملف {filepath} فارغ — سيستخدم البرومبت الافتراضي.")
-        return DEFAULT_SYSTEM_PROMPT
-
-    return prompt
+    return prompt or DEFAULT_SYSTEM_PROMPT
 
 
-# ── تحميل المفاتيح ─────────────────────────────────────────
 def load_keys() -> dict[str, list[str]]:
     keys: dict[str, list[str]] = {}
     missing: list[str] = []
-
     for provider, cfg in PROVIDER_CONFIG.items():
-        provider_keys = []
+        pkeys = []
         for var in cfg["secret_vars"]:
             val = os.environ.get(var, "").strip()
             if val:
-                provider_keys.append(val)
+                pkeys.append(val)
             else:
                 missing.append(var)
-        keys[provider] = provider_keys
-
+        keys[provider] = pkeys
     if missing:
-        print("[تحذير] المتغيرات التالية غير موجودة أو فارغة:")
+        print("[تحذير] متغيرات غير موجودة:")
         for m in missing:
-            print(f"         - {m}")
-        print("  أضفها في: Settings → Secrets and variables → Actions\n")
-
+            print(f"  - {m}")
+        print()
     for provider, pkeys in keys.items():
         if not pkeys:
-            print(f"[ERROR] لا يوجد أي مفتاح صالح للمزود '{provider}'.")
+            print(f"[ERROR] لا يوجد مفتاح صالح للمزود '{provider}'.")
             sys.exit(1)
-
     return keys
 
 
-def get_key(provider: str, all_keys: dict[str, list[str]]) -> str:
+def get_key(provider: str, all_keys: dict) -> str:
     pkeys = all_keys[provider]
     return pkeys[_key_index[provider] % len(pkeys)]
 
@@ -100,31 +155,25 @@ def rotate_key(provider: str) -> None:
     _key_index[provider] += 1
 
 
-# ── تحميل النماذج ───────────────────────────────────────────
 def load_models(filepath: str) -> list[dict]:
     if not os.path.exists(filepath):
-        print(f"[ERROR] لم يُعثر على ملف النماذج: {filepath}")
+        print(f"[ERROR] لم يُعثر على: {filepath}")
         sys.exit(1)
-
     models = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if "|" in line:
-                name, provider = [p.strip() for p in line.split("|", 1)]
-            else:
-                name, provider = line, "gemini"
+            name, provider = ([p.strip() for p in line.split("|", 1)]
+                              if "|" in line else (line, "gemini"))
             provider = provider.lower()
             if provider not in PROVIDER_CONFIG:
-                print(f"[تحذير] مزود غير معروف '{provider}' — تم تخطيه.")
                 continue
             models.append({"name": name, "provider": provider})
     return models
 
 
-# ── اختيار النموذج ──────────────────────────────────────────
 def select_model(models: list[dict]) -> dict:
     print("\n╔══════╦═══════════════════════════╦═══════════╗")
     print("║  #   ║  اسم النموذج                  ║  المزود   ║")
@@ -132,24 +181,22 @@ def select_model(models: list[dict]) -> dict:
     for i, m in enumerate(models, 1):
         print(f"║  {i:<3} ║  {m['name']:<29} ║  {m['provider']:<9} ║")
     print("╚══════╩═══════════════════════════╩═══════════╝")
-
     while True:
         try:
             choice = int(input("\nاختر رقم النموذج: "))
             if 1 <= choice <= len(models):
                 return models[choice - 1]
-            print(f"الرجاء إدخال رقم بين 1 و {len(models)}")
         except ValueError:
-            print("الرجاء إدخال رقم صحيح.")
+            pass
+        print(f"رقم غير صحيح. أدخل بين 1 و {len(models)}.")
 
 
-# ── إرسال الرسالة ───────────────────────────────────────────
-def chat(model_info: dict, all_keys: dict[str, list[str]],
-        user_message: str, history: list[dict]) -> str:
+def chat(model_info: dict, all_keys: dict,
+         user_message: str, history: list[dict]) -> str:
     try:
         from openai import OpenAI, RateLimitError, AuthenticationError
     except ImportError:
-        print("[ERROR] مكتبة openai غير مثبتة. نفّذ: pip install openai")
+        print("[ERROR] pip install openai")
         sys.exit(1)
 
     provider = model_info["provider"]
@@ -167,76 +214,136 @@ def chat(model_info: dict, all_keys: dict[str, list[str]],
                 temperature=0.7,
             )
             return resp.choices[0].message.content
-
         except RateLimitError:
-            print(f"[تحذير] حد الاستخدام — تحويل المفتاح...")
+            print("[تحذير] Rate limit — تحويل المفتاح...")
             rotate_key(provider)
         except AuthenticationError:
-            print(f"[خطأ] مفتاح غير صالح — تحويل...")
+            print("[خطأ] مفتاح غير صالح — تحويل...")
             rotate_key(provider)
         except Exception as e:
-            return f"[خطأ غير متوقع] {e}"
+            return f"[خطأ] {e}"
+    return "[خطأ] جميع المفاتيح استُنفدت."
 
-    return "[خطأ] جميع المفاتيح استُنفدت أو غير صالحة."
+
+# ─────────────────────────────────────────────────────────────
+# البرنامج الرئيسي
+# ─────────────────────────────────────────────────────────────
+
+HELP_TEXT = """
+أوامر متاحة:
+  @skill <اسم>          — تفعيل مهارة (تجلب SKILL.md وتضبطه كبرومبت)
+  @skill <اسم> <رسالة>  — تفعيل المهارة وإرسال رسالة فوراً
+  @skills              — عرض المهارات المتاحة
+  جديد / new          — بدء محادثة جديدة
+  تحديث / reload       — إعادة تحميل البرومبت من الملف
+  خروج / exit          — إنهاء البرنامج
+  مساعدة / help         — عرض هذه القائمة
+""".strip()
 
 
-# ── البرنامج الرئيسي ────────────────────────────────────────
 def main():
     print("\n╔══════════════════════════════╗")
-    print("║       Selfe Agent v2.1       ║")
+    print("║       Selfe Agent v3.0       ║")
     print("╚══════════════════════════════╝")
 
-    # 1. تحميل البرومبت
+    # 1. تحميل المهارات
+    skills = load_skills(SKILLS_FILE)
+    if skills:
+        print(f"[OK] المهارات المتاحة: {', '.join(skills.keys())}")
+    else:
+        print("[تحذير] لم يُعثر على skills.txt أو فارغ.")
+
+    # 2. تحميل البرومبت الافتراضي
     system_prompt = load_system_prompt(SYSTEM_PROMPT_FILE)
-    # عرض معاينة مختصرة للبرومبت
     preview = system_prompt[:80].replace("\n", " ")
     print(f"[OK] البرومبت: \"{preview}{'...' if len(system_prompt) > 80 else ''}\"")
 
-    # 2. تحميل المفاتيح
+    # 3. تحميل المفاتيح
     all_keys = load_keys()
     for provider, pkeys in all_keys.items():
         print(f"[OK] {provider}: {len(pkeys)} مفتاح محمّل.")
 
-    # 3. تحميل النماذج
+    # 4. تحميل النماذج
     models = load_models(MODELS_FILE)
-    print(f"[OK] تم تحميل {len(models)} نموذج من {MODELS_FILE}")
+    print(f"[OK] تم تحميل {len(models)} نموذج.")
 
-    # 4. اختيار النموذج
+    # 5. اختيار النموذج
     model_info = select_model(models)
-    print(f"\n[OK] النموذج المختار : {model_info['name']}")
-    print(f"[OK] المزود          : {model_info['provider']}")
+    print(f"\n[OK] النموذج : {model_info['name']}  |المزود: {model_info['provider']}")
+    print("\nاكتب 'مساعدة' لعرض جميع الأوامر.\n")
 
-    # 5. حلقة المحادثة
-    print("\nاكتب رسالتك (اكتب 'خروج' للإنهاء، 'جديد' لمحادثة جديدة):\n")
-
-    # التاريخ يبدأ بالبرومبت المقروء من الملف
-    history: list[dict] = [
-        {"role": "system", "content": system_prompt}
-    ]
+    # 6. حلقة المحادثة
+    history: list[dict] = [{"role": "system", "content": system_prompt}]
 
     while True:
-        user_input = input("أنت: ").strip()
+        try:
+            user_input = input("أنت: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nوداعاً!")
+            break
+
         if not user_input:
             continue
-        if user_input.lower() in ("خروج", "exit", "quit"):
+
+        low = user_input.lower()
+
+        # ── أوامر النظام ─────────────────────────────────
+        if low in ("خروج", "exit", "quit"):
             print("وداعاً!")
             break
-        if user_input.lower() in ("جديد", "new", "reset"):
-            history = [{"role": "system", "content": system_prompt}]
+
+        if low in ("مساعدة", "help"):
+            print(HELP_TEXT)
+            continue
+
+        if low in ("جديد", "new", "reset"):
+            history = [{"role": "system", "content": history[0]["content"]}]
             print("[تم] بدء محادثة جديدة.\n")
             continue
-        # إعادة تحميل البرومبت لحظياً بدون إعادة تشغيل
-        if user_input.lower() in ("تحديث", "reload"):
+
+        if low in ("تحديث", "reload"):
             system_prompt = load_system_prompt(SYSTEM_PROMPT_FILE)
             history[0]["content"] = system_prompt
             print("[تم] إعادة تحميل البرومبت.\n")
             continue
 
+        if low == "@skills":
+            if skills:
+                print("المهارات المتاحة:")
+                for name, url in skills.items():
+                    print(f"  - {name}\n    {url}")
+            else:
+                print("لا توجد مهارات. أضف مهارات في skills.txt")
+            print()
+            continue
+
+        # ── أمر @skill ───────────────────────────────────
+        if low.startswith("@skill "):
+            # صيغة: @skill <اسم>  أو  @skill <اسم> <رسالة>
+            rest = user_input[len("@skill "):].strip()
+            parts = rest.split(None, 1)          # الأول: الاسم | الباقي: الرسالة
+            skill_name  = parts[0] if parts else ""
+            inline_msg  = parts[1] if len(parts) > 1 else None
+
+            result_msg, history = activate_skill(skill_name, skills, history)
+            print(result_msg)
+            print()
+
+            # إذا كانت هناك رسالة مرفقة → أرسلها فوراً
+            if inline_msg and "[خطأ]" not in result_msg:
+                print(f"{model_info['name']}: ", end="", flush=True)
+                reply = chat(model_info, all_keys, inline_msg, history)
+                print(reply)
+                print()
+                history.append({"role": "user",      "content": inline_msg})
+                history.append({"role": "assistant", "content": reply})
+            continue
+
+        # ── رسالة عادية ───────────────────────────────────
         print(f"{model_info['name']}: ", end="", flush=True)
         reply = chat(model_info, all_keys, user_input, history)
         print(reply)
         print()
-
         history.append({"role": "user",      "content": user_input})
         history.append({"role": "assistant", "content": reply})
 
