@@ -1,8 +1,8 @@
 {
-  "total_evals": 13,
-  "total_score": 130,
+  "total_evals": 14,
+  "total_score": 138,
   "improvements_triggered": 0,
-  "avg_score": 10.0,
+  "avg_score": 9.86,
   "score_distribution": {
     "0": 0,
     "1": 0,
@@ -12,9 +12,9 @@
     "5": 0,
     "6": 0,
     "7": 0,
-    "8": 0,
+    "8": 1,
     "9": 0,
     "10": 13
   },
-  "last_updated": "2026-04-13T20:57:45Z"
+  "last_updated": "2026-04-13T21:00:38Z"
 }
