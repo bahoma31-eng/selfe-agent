@@ -1,14 +1,20 @@
 import os
 import sys
+import time
 
 # =========================================================
-# Selfe Agent v3.0
+# Selfe Agent v3.1.0
 # يدعم مفاتيح متعددة:
 #   GEMINI_API_KEY_1 .. GEMINI_API_KEY_4  → نماذج Gemini
 #   GROQ_API_KEY                          → نماذج Groq
 # النماذج     → models.txt
 # البرومبت    → system_prompt.txt  (افتراضي)
 # المهارات    → skills.txt  (جلب SKILL.md من GitHub)
+# =========================================================
+# [v3.1.0] تحسينات المرحلة الرابعة:
+#   - temperature ديناميكية حسب نوع الطلب
+#   - max_tokens=4096 لمنع القطع
+#   - آلية retry مع Exponential Backoff
 # =========================================================
 
 import re
@@ -17,6 +23,7 @@ import urllib.request
 MODELS_FILE        = "models.txt"
 SYSTEM_PROMPT_FILE = "system_prompt.txt"
 SKILLS_FILE        = "skills.txt"
+MAX_RETRIES        = 3
 
 DEFAULT_SYSTEM_PROMPT = "أنت مساعد ذكاء اصطناعي مفيد ودقيق."
 
@@ -36,6 +43,45 @@ PROVIDER_CONFIG = {
 }
 
 _key_index: dict[str, int] = {p: 0 for p in PROVIDER_CONFIG}
+
+
+# ─────────────────────────────────────────────────────────────
+# temperature ديناميكية — [v3.1.0]
+# ─────────────────────────────────────────────────────────────
+
+def detect_temperature(message: str) -> float:
+    """
+    تحديد قيمة temperature بناءً على نوع الطلب:
+      - طلبات الكود والتصحيح → 0.2  (دقيق، أقل هلوسة)
+      - طلبات حقيقية/تحليلية → 0.5  (توازن دقة/طلاقة)
+      - طلبات إبداعية       → 0.9  (تنوع عالٍ)
+      - عام                 → 0.7  (الافتراضي)
+    """
+    msg = message.lower()
+
+    code_keywords = [
+        "كود", "code", "دالة", "function", "اكتب", "برمجة",
+        "خطأ", "debug", "script", "سكريبت", "class", "كلاس",
+        "api", "endpoint", "sql", "query", "استعلام",
+    ]
+    factual_keywords = [
+        "ما هو", "what is", "كيف يعمل", "how does", "اشرح",
+        "explain", "عرّف", "define", "فرق", "difference",
+        "متى", "when", "لماذا", "why", "من هو", "who is",
+    ]
+    creative_keywords = [
+        "قصيدة", "poem", "اقتراح", "suggest", "فكرة", "idea",
+        "أفكار", "ideas", "إبداع", "creative", "تصميم", "design",
+        "تخيّل", "imagine", "قصة", "story",
+    ]
+
+    if any(k in msg for k in code_keywords):
+        return 0.2
+    if any(k in msg for k in creative_keywords):
+        return 0.9
+    if any(k in msg for k in factual_keywords):
+        return 0.5
+    return 0.7
 
 
 # ─────────────────────────────────────────────────────────────
@@ -67,7 +113,7 @@ def fetch_skill(url: str) -> str:
     يستخدم urllib (بدون مكتبات خارجية).
     """
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "selfe-agent/3.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "selfe-agent/3.1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.read().decode("utf-8")
     except Exception as e:
@@ -96,7 +142,6 @@ def activate_skill(skill_name: str, skills: dict[str, str],
     if not content:
         return f"[خطأ] تعذّر جلب المهارة من الرابط.\nتحقّق من صحة الرابط في skills.txt", history
 
-    # ضبط البرومبت الجديد وإعادة التاريخ
     new_history = [{"role": "system", "content": content}]
     msg = (
         f"[تم] تفعيل المهارة \033[1m{key}\033[0m ✔\n"
@@ -193,35 +238,57 @@ def select_model(models: list[dict]) -> dict:
 
 def chat(model_info: dict, all_keys: dict,
          user_message: str, history: list[dict]) -> str:
+    """
+    إرسال رسالة للنموذج مع:
+      - temperature ديناميكية حسب نوع الطلب  [v3.1.0]
+      - max_tokens=4096 لمنع قطع الردود      [v3.1.0]
+      - retry مع Exponential Backoff         [v3.1.0]
+    """
     try:
         from openai import OpenAI, RateLimitError, AuthenticationError
     except ImportError:
         print("[ERROR] pip install openai")
         sys.exit(1)
 
-    provider = model_info["provider"]
-    cfg      = PROVIDER_CONFIG[provider]
-    pkeys    = all_keys[provider]
-    messages = history + [{"role": "user", "content": user_message}]
+    provider  = model_info["provider"]
+    cfg       = PROVIDER_CONFIG[provider]
+    pkeys     = all_keys[provider]
+    messages  = history + [{"role": "user", "content": user_message}]
+    temp      = detect_temperature(user_message)
 
     for _ in range(len(pkeys)):
         client = OpenAI(api_key=get_key(provider, all_keys),
                         base_url=cfg["base_url"])
-        try:
-            resp = client.chat.completions.create(
-                model=model_info["name"],
-                messages=messages,
-                temperature=0.7,
-            )
-            return resp.choices[0].message.content
-        except RateLimitError:
-            print("[تحذير] Rate limit — تحويل المفتاح...")
-            rotate_key(provider)
-        except AuthenticationError:
-            print("[خطأ] مفتاح غير صالح — تحويل...")
-            rotate_key(provider)
-        except Exception as e:
-            return f"[خطأ] {e}"
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = client.chat.completions.create(
+                    model=model_info["name"],
+                    messages=messages,
+                    temperature=temp,
+                    max_tokens=4096,
+                )
+                return resp.choices[0].message.content
+
+            except RateLimitError:
+                print("[تحذير] Rate limit — تحويل المفتاح...")
+                rotate_key(provider)
+                break  # جرّب المفتاح التالي فوراً
+
+            except AuthenticationError:
+                print("[خطأ] مفتاح غير صالح — تحويل...")
+                rotate_key(provider)
+                break
+
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = 2 ** attempt  # 1s، 2s، 4s
+                    print(f"[تحذير] خطأ مؤقت، إعادة المحاولة "
+                          f"{attempt + 1}/{MAX_RETRIES} بعد {wait}s...")
+                    time.sleep(wait)
+                else:
+                    return f"[خطأ] {e}"
+
     return "[خطأ] جميع المفاتيح استُنفدت."
 
 
@@ -243,7 +310,7 @@ HELP_TEXT = """
 
 def main():
     print("\n╔══════════════════════════════╗")
-    print("║       Selfe Agent v3.0       ║")
+    print("║       Selfe Agent v3.1.0     ║")
     print("╚══════════════════════════════╝")
 
     # 1. تحميل المهارات
@@ -319,9 +386,8 @@ def main():
 
         # ── أمر @skill ───────────────────────────────────
         if low.startswith("@skill "):
-            # صيغة: @skill <اسم>  أو  @skill <اسم> <رسالة>
             rest = user_input[len("@skill "):].strip()
-            parts = rest.split(None, 1)          # الأول: الاسم | الباقي: الرسالة
+            parts = rest.split(None, 1)
             skill_name  = parts[0] if parts else ""
             inline_msg  = parts[1] if len(parts) > 1 else None
 
@@ -329,7 +395,6 @@ def main():
             print(result_msg)
             print()
 
-            # إذا كانت هناك رسالة مرفقة → أرسلها فوراً
             if inline_msg and "[خطأ]" not in result_msg:
                 print(f"{model_info['name']}: ", end="", flush=True)
                 reply = chat(model_info, all_keys, inline_msg, history)
