@@ -1,6 +1,7 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v6.1.0
+# agent_ci.py — Selfe Agent v6.1.1
 # إصلاح شامل: فصل طبقات الفشل + Retry ذكي + ReAct محسّن
+# v6.1.1: إصلاح TypeError عند raw=None (choices[0].message.content)
 # v6.1.0: 3 حلول لاستنزاف حصة API:
 #   1. كشف quota_exceeded وتخطي المفتاح كلياً
 #   2. تدوير تلقائي بين مزودين (Gemini → Groq) عند 429/quota
@@ -168,7 +169,7 @@ class ErrorMonitor:
 
 
 # ===================================================================
-# SmartAPIClient — v6.1.0
+# SmartAPIClient — v6.1.1
 # الحل #1: كشف quota_exhausted → تخطي المفتاح فوراً
 # الحل #2: تدوير تلقائي بين مزودين عند استنزاف كل مفاتيح مزود
 # الحل #3: Fallback كامل إلى Groq عند فشل المزود الأساسي
@@ -177,7 +178,7 @@ class ErrorMonitor:
 class SmartAPIClient:
     """
     يتولى حصراً: إعادة المحاولة عند أخطاء الشبكة/API.
-    v6.1.0:
+    v6.1.1:
       - كشف quota_exhausted → تخطي المفتاح فوراً (لا تنتظر)
       - تدوير بين مزودين عند استنزاف كل مفاتيح المزود الحالي
       - Fallback إلى Groq عند فشل Gemini بالكامل
@@ -259,7 +260,7 @@ class SmartAPIClient:
     def chat_completions_create(self, step: int = 0, **kwargs) -> Any:
         """
         يحاول الاتصال بـ API مع إعادة المحاولة الذكية.
-        v6.1.0:
+        v6.1.1:
           - quota_exhausted → تخطي المفتاح فوراً بدون انتظار
           - استنزاف كل المفاتيح → تفعيل Groq Fallback تلقائياً
         """
@@ -379,7 +380,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/6.1.0",
+        "User-Agent": "selfe-agent/6.1.1",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -419,7 +420,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v6.1.0
+# ReAct Loop — v6.1.1
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -590,7 +591,7 @@ def react_loop(
     for step in range(1, max_steps + 1):
         # استخدام النموذج الفعلي (قد تحوّل لـ Fallback)
         active_model = smart_client.active_model
-        print(f"[ReAct] خطوة {step}/{max_steps} — نموذج: {active_model}")
+        print(f"[ReAct] خطوة {step}/{max_steps}")
 
         try:
             resp = smart_client.chat_completions_create(
@@ -600,13 +601,34 @@ def react_loop(
                 temperature=0.2,
                 max_tokens=4096,
             )
-            raw    = resp.choices[0].message.content
+            # ── الإصلاح الأساسي v6.1.1 ──────────────────────────────
+            # choices[0].message.content قد يكون None عند بعض النماذج
+            raw = (resp.choices[0].message.content or "").strip()
+            # ─────────────────────────────────────────────────────────
             tokens = getattr(resp.usage, "total_tokens", 0)
             total_tokens += tokens
         except Exception as e:
             return f"⚠️ خطأ API لا يمكن التعافي منه (خطوة {step}): {e}", total_tokens
 
+        # عرض أول 300 حرف من الرد بأمان
         print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
+
+        # إذا كان الرد فارغاً تماماً — عامله كرد بدون أداة
+        if not raw:
+            no_tool_count += 1
+            print(f"[ReAct] رد فارغ (المرة {no_tool_count}).")
+            if no_tool_count >= 3:
+                print("[ReAct] ثلاثة ردود فارغة/بدون أداة → إنهاء.")
+                return "⚠️ لم يُرجع النموذج أي محتوى.", total_tokens
+            messages.append({"role": "assistant", "content": raw or "[empty]"})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "⚠️ ردك كان فارغاً. تذكّر أن ترد بأداة واحدة داخل ```json ... ```\n"
+                    "إذا انتهيت من المهمة استخدم: ```json\n{\"tool\": \"answer\", \"text\": \"ردك\"}\n```"
+                )
+            })
+            continue
 
         action = parse_tool_call(raw)
 
@@ -680,7 +702,8 @@ def react_loop(
             temperature=0.3,
             max_tokens=2048,
         )
-        raw    = resp.choices[0].message.content
+        # تطبيق نفس الإصلاح في الرد النهائي
+        raw    = (resp.choices[0].message.content or "").strip()
         total_tokens += getattr(resp.usage, "total_tokens", 0)
         action = parse_tool_call(raw)
         if action and action.get("tool") == "answer":
@@ -797,7 +820,7 @@ class SelfEvaluator:
                 ],
                 temperature=0.1, max_tokens=256,
             )
-            raw = resp.choices[0].message.content.strip()
+            raw = (resp.choices[0].message.content or "").strip()
             m   = re.search(r"\{.*\}", raw, re.DOTALL)
             return json.loads(m.group()) if m else {"score": 10, "issues": [], "improvements": [], "refined_prompt_addition": ""}
         except Exception as e:
@@ -947,12 +970,12 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 
 
 # ===================================================================
-# main — v6.1.0
+# main — v6.1.1
 # بناء SmartAPIClient مع Groq Fallback
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v6.1.0] تشغيل...")
+    print("\n[Selfe Agent CI v6.1.1] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
@@ -1027,7 +1050,7 @@ def main():
                     ],
                     temperature=0.2, max_tokens=4096,
                 )
-                raw_reply  = resp.choices[0].message.content
+                raw_reply  = (resp.choices[0].message.content or "").strip()
                 clean_code = extract_code_from_reply(raw_reply)
                 tokens     = getattr(resp.usage, "total_tokens", 0)
                 commit_url = push_file_to_github(
@@ -1114,63 +1137,49 @@ def main():
     data         = memory.load_issue_memory()
     current_turn = len(data.get("turns", [])) + 1
 
-    for eval_attempt in range(MAX_SELF_EVAL_RETRIES + 1):
-        if eval_attempt > 0:
-            print(f"[SelfEval] 🔄 إعادة محاولة {eval_attempt}...")
-
+    for attempt in range(MAX_SELF_EVAL_RETRIES + 1):
         messages = memory.build_messages(current_system_prompt, msg)
-        reply    = None
-        tokens   = 0
-
         try:
             resp = smart_client.chat_completions_create(
-                step=eval_attempt,
+                step=0,
                 model=smart_client.active_model,
                 messages=messages,
                 temperature=temp,
                 max_tokens=4096,
             )
-            reply  = resp.choices[0].message.content
-            tokens = getattr(resp.usage, "total_tokens", 0)
+            raw_reply = (resp.choices[0].message.content or "").strip()
+            tokens    = getattr(resp.usage, "total_tokens", 0)
+            final_tokens += tokens
         except Exception as e:
+            write_output(f"⚠️ خطأ API: {e}")
             monitor.flush_to_github()
-            write_output(f"⚠️ خطأ: {e}")
-            memory.save_turn(msg, str(e), model["name"], 0, temp, False)
             sys.exit(1)
 
-        if reply is None:
-            break
-
-        eval_result = evaluator.evaluate(msg, reply)
+        eval_result = evaluator.evaluate(msg, raw_reply)
         score       = eval_result.get("score", 10)
-        print(f"[SelfEval] {score}/10")
+        print(f"[SelfEval] attempt={attempt} score={score}/10")
 
         if score > best_score:
-            best_score   = score
-            best_reply   = reply
-            final_tokens = tokens
+            best_score = score
+            best_reply = raw_reply
 
-        evaluator.log_evaluation(issue_number, current_turn, msg, score, model["name"], eval_attempt, eval_attempt > 0)
-        evaluator.update_prompt_stats(score, eval_attempt > 0)
+        evaluator.log_evaluation(issue_number, current_turn, msg, score, model["name"], attempt, improved=(attempt > 0))
 
         if score >= EVAL_THRESHOLD:
-            final_reply = reply
             break
-        elif eval_attempt < MAX_SELF_EVAL_RETRIES:
+
+        if attempt < MAX_SELF_EVAL_RETRIES:
             current_system_prompt = evaluator.refine_system_prompt(base_system_prompt, eval_result)
-        else:
-            final_reply = best_reply
 
-    if not final_reply:
-        final_reply = best_reply or "⚠️ فشل الوكيل."
-
+    final_reply = best_reply or raw_reply
     if best_score < EVAL_THRESHOLD:
         final_reply += f"\n\n---\n> ⚠️ *أفضل تقييم ذاتي: {best_score}/10*"
 
+    evaluator.update_prompt_stats(best_score, improved=(best_score < EVAL_THRESHOLD))
     write_output(final_reply)
-    memory.save_turn(msg, final_reply, model["name"], final_tokens, temp, True)
+    memory.save_turn(msg, final_reply, model["name"], final_tokens, temp, success=(best_score >= EVAL_THRESHOLD))
     monitor.flush_to_github()
-    print("[CI] اكتمل ✔")
+    print(f"[CI] اكتمل ✔  (best_score={best_score})")
 
 
 if __name__ == "__main__":
