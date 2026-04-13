@@ -43,16 +43,19 @@ jobs:
             echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── استخراج نص الرسالة ────────────────────────────────────
+      # ── استخراج نص الرسالة (آمن من Shell Injection) ───────────
       - name: Extract message from Issue or Comment
         id: extract
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          if [ "${{ github.event_name }}" = "issues" ]; then
-            TITLE="${{ github.event.issue.title }}"
-            BODY="${{ github.event.issue.body }}"
-            MSG=$(printf '%s\n\n%s' "$TITLE" "$BODY")
+          if [ "$EVENT_NAME" = "issues" ]; then
+            MSG=$(printf '%s\n\n%s' "$ISSUE_TITLE" "$ISSUE_BODY")
           else
-            MSG="${{ github.event.comment.body }}"
+            MSG="$COMMENT_BODY"
           fi
           {
             echo "message<<EOF"
