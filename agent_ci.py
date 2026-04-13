@@ -1,10 +1,6 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v5.4.0 (نسخة GitHub Actions)
-# جديد v5.4.0: نظام مراقبة أخطاء منظّم (error-trace)
-#   - Structured error logging بمستويات خطورة واضحة
-#   - تدوير مفاتيح API تلقائياً عند خطأ 429
-#   - Fallback للنموذج البديل عند 503
-#   - تسجيل كل خطأ في memory/error_log.jsonl
+# agent_ci.py — Selfe Agent v5.4.1 (نسخة GitHub Actions)
+# جديد v5.4.1: إصلاح react_loop — منع التوقف عند غياب الأداة
 # =============================================================
 
 import os
@@ -48,25 +44,23 @@ PROVIDER_CONFIG = {
 # ErrorMonitor — نظام تتبّع الأخطاء المنظّم (v5.4.0)
 # ===================================================================
 
-# مستويات الخطورة
 SEVERITY_INFO     = "INFO"
 SEVERITY_WARNING  = "WARNING"
 SEVERITY_ERROR    = "ERROR"
 SEVERITY_CRITICAL = "CRITICAL"
 
-# تصنيف رموز الأخطاء
 ERROR_SEVERITY_MAP = {
     400: SEVERITY_ERROR,
-    401: SEVERITY_CRITICAL,   # مفتاح خاطئ — يحتاج تدخّلاً
+    401: SEVERITY_CRITICAL,
     403: SEVERITY_CRITICAL,
-    429: SEVERITY_WARNING,    # تجاوز الحصة — يُدار تلقائياً
+    429: SEVERITY_WARNING,
     500: SEVERITY_ERROR,
-    503: SEVERITY_WARNING,    # ازدحام مؤقت — يُعاد المحاولة
+    503: SEVERITY_WARNING,
 }
 
 
 class ErrorMonitor:
-    """نظام تتبّع وتسجيل الأخطاء بصيغة منظّمة."""
+    """\u0646\u0638\u0627\u0645 \u062a\u062a\u0628\u0651\u0639 \u0648\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0623\u062e\u0637\u0627\u0621 \u0628\u0635\u064a\u063a\u0629 \u0645\u0646\u0638\u0651\u0645\u0629."""
 
     def __init__(self, owner: str, repo: str, issue_number: str, model_name: str):
         self.owner        = owner
@@ -76,7 +70,6 @@ class ErrorMonitor:
         self._buffer: List[dict] = []
 
     def _classify(self, error_str: str) -> tuple:
-        """يستخرج رمز الخطأ ومستوى خطورته من نص الخطأ."""
         code_match = re.search(r"Error code:\s*(\d+)", str(error_str))
         code = int(code_match.group(1)) if code_match else 0
         severity = ERROR_SEVERITY_MAP.get(code, SEVERITY_ERROR)
@@ -89,17 +82,13 @@ class ErrorMonitor:
         return error_code in (429, 503)
 
     def _retry_delay(self, error_code: int, attempt: int) -> float:
-        """يحسب وقت الانتظار المناسب بحسب نوع الخطأ."""
         if error_code == 429:
-            # استخراج وقت الانتظار من رسالة الخطأ إن وُجد
             return 20.0
-        return 2 ** attempt  # exponential backoff للأخطاء الأخرى
+        return 2 ** attempt
 
     def log(self, error: Exception, context: str = "", step: int = 0) -> dict:
-        """يسجّل الخطأ بصيغة منظّمة ويُرجع بيانات التصنيف."""
         error_str  = str(error)
         code, severity = self._classify(error_str)
-
         entry = {
             "ts":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "severity":     severity,
@@ -112,16 +101,12 @@ class ErrorMonitor:
             "rotate_key":   self._should_rotate_key(code),
             "retry_later":  self._should_retry_later(code),
         }
-
-        # طباعة منظّمة في الـ log
-        icon = {"INFO": "ℹ", "WARNING": "⚠", "ERROR": "✖", "CRITICAL": "🔴"}.get(severity, "?")
-        print(f"[ErrorMonitor] {icon} [{severity}] code={code} ctx={context} → {error_str[:120]}")
-
+        icon = {"INFO": "\u2139", "WARNING": "\u26a0", "ERROR": "\u2716", "CRITICAL": "\U0001f534"}.get(severity, "?")
+        print(f"[ErrorMonitor] {icon} [{severity}] code={code} ctx={context} \u2192 {error_str[:120]}")
         self._buffer.append(entry)
         return entry
 
     def flush_to_github(self):
-        """يرفع سجلات الأخطاء المتراكمة إلى GitHub."""
         if not self._buffer:
             return
         try:
@@ -133,23 +118,16 @@ class ErrorMonitor:
                 f"monitor(error-log): {len(self._buffer)} event(s)",
             )
         except Exception as e:
-            print(f"[ErrorMonitor] ⚠ flush failed: {e}")
+            print(f"[ErrorMonitor] \u26a0 flush failed: {e}")
         finally:
             self._buffer.clear()
 
 
 # ===================================================================
-# SmartAPIClient — عميل API ذكي مع تدوير مفاتيح وفالباك
+# SmartAPIClient
 # ===================================================================
 
 class SmartAPIClient:
-    """
-    يُغلّف openai.OpenAI مع:
-      - تدوير مفاتيح API تلقائياً عند 429
-      - إعادة المحاولة مع Exponential Backoff
-      - تسجيل كل خطأ عبر ErrorMonitor
-    """
-
     def __init__(self, keys: List[str], base_url: str, model_name: str, monitor: ErrorMonitor):
         from openai import OpenAI
         self._OpenAI    = OpenAI
@@ -165,56 +143,39 @@ class SmartAPIClient:
         return OpenAI(api_key=self.keys[self._key_idx], base_url=self.base_url)
 
     def _rotate_key(self):
-        """يُدوّر إلى المفتاح التالي."""
         if len(self.keys) <= 1:
-            print("[SmartAPIClient] ⚠ مفتاح واحد فقط، لا يوجد مفتاح بديل.")
+            print("[SmartAPIClient] \u26a0 \u0645\u0641\u062a\u0627\u062d \u0648\u0627\u062d\u062f \u0641\u0642\u0637\u060c \u0644\u0627 \u064a\u0648\u062c\u062f \u0645\u0641\u062a\u0627\u062d \u0628\u062f\u064a\u0644.")
             return False
         self._key_idx = (self._key_idx + 1) % len(self.keys)
         self._client  = self._make_client()
-        print(f"[SmartAPIClient] 🔄 تدوير المفتاح → مفتاح #{self._key_idx + 1}")
+        print(f"[SmartAPIClient] \U0001f504 \u062a\u062f\u0648\u064a\u0631 \u0627\u0644\u0645\u0641\u062a\u0627\u062d \u2192 \u0645\u0641\u062a\u0627\u062d #{self._key_idx + 1}")
         return True
 
     def chat_completions_create(self, step: int = 0, **kwargs) -> Any:
-        """
-        يُرسل طلب API مع معالجة ذكية للأخطاء:
-          429 → تدوير المفتاح + انتظار 20s
-          503 → انتظار exponential backoff
-          غيرها → رفع الخطأ مباشرةً
-        """
         last_error = None
-
         for attempt in range(MAX_RETRIES):
             try:
                 return self._client.chat.completions.create(**kwargs)
-
             except Exception as e:
                 entry = self.monitor.log(e, context="chat_completions_create", step=step)
                 last_error = e
-
                 if entry["error_code"] == 429:
-                    # تدوير المفتاح أولاً
-                    rotated = self._rotate_key()
-                    delay   = entry.get("retry_delay", 20.0)
-                    print(f"[SmartAPIClient] ⏳ انتظار {delay}s بعد 429...")
+                    self._rotate_key()
+                    delay = entry.get("retry_delay", 20.0)
+                    print(f"[SmartAPIClient] \u23f3 \u0627\u0646\u062a\u0638\u0627\u0631 {delay}s \u0628\u0639\u062f 429...")
                     time.sleep(delay)
-
                 elif entry["error_code"] == 503:
                     delay = 2 ** (attempt + 1)
-                    print(f"[SmartAPIClient] ⏳ انتظار {delay}s بعد 503...")
+                    print(f"[SmartAPIClient] \u23f3 \u0627\u0646\u062a\u0638\u0627\u0631 {delay}s \u0628\u0639\u062f 503...")
                     time.sleep(delay)
-
                 elif entry["severity"] == SEVERITY_CRITICAL:
-                    # لا فائدة من إعادة المحاولة
                     raise
-
                 elif attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
-
         raise last_error
 
     @property
     def raw(self):
-        """يُرجع client الخام لاستخدامات خاصة."""
         return self._client
 
 
@@ -225,8 +186,6 @@ class SmartAPIClient:
 ToolType = TypeVar('ToolType', bound=Callable[..., Any])
 
 class ToolRegistry:
-    """سجل الأدوات المتاحة للوكيل."""
-
     def __init__(self):
         self._tools: Dict[str, Any] = {}
 
@@ -238,9 +197,9 @@ class ToolRegistry:
             elif hasattr(tool, '__class__') and hasattr(tool.__class__, '__name__'):
                 tool_name = tool.__class__.__name__
             else:
-                raise ValueError("تعذّر تحديد اسم الأداة.")
+                raise ValueError("\u062a\u0639\u0630\u0651\u0631 \u062a\u062d\u062f\u064a\u062f \u0627\u0633\u0645 \u0627\u0644\u0623\u062f\u0627\u0629.")
         if tool_name in self._tools:
-            raise ValueError(f"الأداة '{tool_name}' مسجلة مسبقاً.")
+            raise ValueError(f"\u0627\u0644\u0623\u062f\u0627\u0629 '{tool_name}' \u0645\u0633\u062c\u0644\u0629 \u0645\u0633\u0628\u0642\u0627\u064b.")
         self._tools[tool_name] = tool
 
     def get_tool(self, name: str) -> Optional[Any]:
@@ -257,20 +216,20 @@ class ToolRegistry:
 
 
 # ===================================================================
-# أدوات GitHub API
+# GitHub API
 # ===================================================================
 
 def _github_request(method: str, path: str, data: dict = None) -> dict:
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
-        raise RuntimeError("GITHUB_TOKEN غير موجود.")
+        raise RuntimeError("GITHUB_TOKEN \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f.")
     url = f"https://api.github.com{path}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/5.4.0",
+        "User-Agent": "selfe-agent/5.4.1",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -310,61 +269,60 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v5.4.0 (يستخدم SmartAPIClient)
+# ReAct Loop — v5.4.1
+# إصلاح: عند غياب الأداة (action is None) — لا ينتهي اللوب بل يطلب من النموذج المتابعة
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
-أنت Selfe، وكيل ذكاء اصطناعي متقدّم.
-لديك صلاحية استخدام الأدوات التالية:
+\u0623\u0646\u062a Selfe\u060c \u0648\u0643\u064a\u0644 \u0630\u0643\u0627\u0621 \u0627\u0635\u0637\u0646\u0627\u0639\u064a \u0645\u062a\u0642\u062f\u0651\u0645.
+\u0644\u062f\u064a\u0643 \u0635\u0644\u0627\u062d\u064a\u0629 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0627\u0644\u0623\u062f\u0648\u0627\u062a \u0627\u0644\u062a\u0627\u0644\u064a\u0629:
 
-1. push_file   — رفع ملف إلى GitHub
-2. read_file   — قراءة ملف من GitHub
-3. list_files  — عرض قائمة الملفات في مجلد
-4. answer      — إرجاع الرد النهائي للمستخدم
+1. push_file   — \u0631\u0641\u0639 \u0645\u0644\u0641 \u0625\u0644\u0649 GitHub
+2. read_file   — \u0642\u0631\u0627\u0621\u0629 \u0645\u0644\u0641 \u0645\u0646 GitHub
+3. list_files  — \u0639\u0631\u0636 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0645\u0644\u0641\u0627\u062a \u0641\u064a \u0645\u062c\u0644\u062f
+4. answer      — \u0625\u0631\u062c\u0627\u0639 \u0627\u0644\u0631\u062f \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0644\u0644\u0645\u0633\u062a\u062e\u062f\u0645
 
-فورمات استخدام الأدوات (اكتب واحدةً فقط في كل رد):
+\u0641\u0648\u0631\u0645\u0627\u062a \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0627\u0644\u0623\u062f\u0648\u0627\u062a (\u0627\u0643\u062a\u0628 \u0648\u0627\u062d\u062f\u0629\u064b \u0641\u0642\u0637 \u0641\u064a \u0643\u0644 \u0631\u062f):
 
-للقراءة:
+\u0644\u0644\u0642\u0631\u0627\u0621\u0629:
 ```json
-{"tool": "read_file", "path": "<مسار الملف>"}
+{"tool": "read_file", "path": "<\u0645\u0633\u0627\u0631 \u0627\u0644\u0645\u0644\u0641>"}
 ```
-لعرض الملفات:
+\u0644\u0639\u0631\u0636 \u0627\u0644\u0645\u0644\u0641\u0627\u062a:
 ```json
-{"tool": "list_files", "path": "<المجلد>"}
+{"tool": "list_files", "path": "<\u0627\u0644\u0645\u062c\u0644\u062f>"}
 ```
-للرفع:
+\u0644\u0644\u0631\u0641\u0639:
 ```json
-{"tool": "push_file", "path": "<مسار>", "content": "<المحتوى>", "message": "<رسالة commit>"}
+{"tool": "push_file", "path": "<\u0645\u0633\u0627\u0631>", "content": "<\u0627\u0644\u0645\u062d\u062a\u0648\u0649>", "message": "<\u0631\u0633\u0627\u0644\u0629 commit>"}
 ```
-للإجابة النهائية:
+\u0644\u0644\u0625\u062c\u0627\u0628\u0629 \u0627\u0644\u0646\u0647\u0627\u0626\u064a\u0629:
 ```json
-{"tool": "answer", "text": "<ردك النهائي هنا>"}
+{"tool": "answer", "text": "<\u0631\u062f\u0643 \u0627\u0644\u0646\u0647\u0627\u0626\u064a \u0647\u0646\u0627>"}
 ```
 
-قواعد مهمة:
-- اكتب دائما JSON داخل ```json ... ``` فقط
-- لا تكتب أداتين في نفس الرد
-- إذا لم تحتج أدوات، استخدم answer مباشرة
+\u0642\u0648\u0627\u0639\u062f \u0645\u0647\u0645\u0629:
+- \u0627\u0643\u062a\u0628 \u062f\u0627\u0626\u0645\u0627 JSON \u062f\u0627\u062e\u0644 ```json ... ``` \u0641\u0642\u0637
+- \u0644\u0627 \u062a\u0643\u062a\u0628 \u0623\u062f\u0627\u062a\u064a\u0646 \u0641\u064a \u0646\u0641\u0633 \u0627\u0644\u0631\u062f
+- \u0625\u0630\u0627 \u0644\u0645 \u062a\u062d\u062a\u062c \u0623\u062f\u0648\u0627\u062a\u060c \u0627\u0633\u062a\u062e\u062f\u0645 answer \u0645\u0628\u0627\u0634\u0631\u0629
+- \u0644\u0627 \u062a\u0636\u0639 \u0623\u064a \u0646\u0635 \u0642\u0628\u0644 JSON \u0623\u0648 \u0628\u0639\u062f\u0647 \u0641\u064a \u0646\u0641\u0633 \u0627\u0644\u0631\u062f
 """
 
-# كلمات تشير إلى مهمة معقدة تحتاج ReAct
 REACT_KEYWORDS = [
-    "ثم", "بعد ذلك", "حلّل", "اقرأ", "تحقّق",
-    "خطوات", "عدة", "أولاً", "ثانياً", "ثالثاً",
-    "افحص", "عدل", "راجع",
+    "\u062b\u0645", "\u0628\u0639\u062f \u0630\u0644\u0643", "\u062d\u0644\u0651\u0644", "\u0627\u0642\u0631\u0623", "\u062a\u062d\u0642\u0651\u0642",
+    "\u062e\u0637\u0648\u0627\u062a", "\u0639\u062f\u0629", "\u0623\u0648\u0644\u0627\u064b", "\u062b\u0627\u0646\u064a\u0627\u064b", "\u062b\u0627\u0644\u062b\u0627\u064b",
+    "\u0627\u0641\u062d\u0635", "\u0639\u062f\u0644", "\u0631\u0627\u062c\u0639",
     "then", "after that", "analyze", "check", "read", "steps", "multiple",
 ]
 
 
 def is_complex_task(msg: str) -> bool:
-    """يكتشف تلقائياً إذا كانت المهمة تحتاج ReAct Loop."""
     msg_lower = msg.lower()
     matched = sum(1 for kw in REACT_KEYWORDS if kw in msg_lower)
     return matched >= 2 or (matched >= 1 and len(msg) > 300)
 
 
 def parse_tool_call(text: str) -> Optional[dict]:
-    """يستخرج JSON أداة من رد النموذج."""
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         try:
@@ -381,7 +339,6 @@ def parse_tool_call(text: str) -> Optional[dict]:
 
 
 def execute_tool(action: dict, owner: str, repo: str) -> str:
-    """ينفّذ الأداة ويرجع نتيجة نصية."""
     tool = action.get("tool", "")
 
     if tool == "push_file":
@@ -390,20 +347,20 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         message = action.get("message", f"feat: push {path} via Selfe Agent")
         try:
             commit_url = push_file_to_github(owner, repo, path, content, message)
-            return f"✅ تم رفع `{path}` بنجاح.\ncommit: {commit_url}"
+            return f"\u2705 \u062a\u0645 \u0631\u0641\u0639 `{path}` \u0628\u0646\u062c\u0627\u062d.\ncommit: {commit_url}"
         except Exception as e:
-            return f"❌ فشل push_file: {e}"
+            return f"\u274c \u0641\u0634\u0644 push_file: {e}"
 
     elif tool == "read_file":
         path = action.get("path", "")
         if not path:
-            return "❌ يجب تحديد path."
+            return "\u274c \u064a\u062c\u0628 \u062a\u062d\u062f\u064a\u062f path."
         content = read_file_from_github(owner, repo, path)
         if content is None:
-            return f"❌ لم يُعثر على `{path}`."
+            return f"\u274c \u0644\u0645 \u064a\u064f\u0639\u062b\u0631 \u0639\u0644\u0649 `{path}`."
         if len(content) > 8000:
             content = content[:8000] + "\n...[truncated]"
-        return f"📄 محتوى `{path}`:\n```\n{content}\n```"
+        return f"\U0001f4c4 \u0645\u062d\u062a\u0648\u0649 `{path}`:\n```\n{content}\n```"
 
     elif tool == "list_files":
         path = action.get("path", "")
@@ -413,20 +370,20 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         try:
             items = _github_request("GET", api_path)
             if not isinstance(items, list):
-                return f"❌ لم يُعثر على المجلد `{path}`."
+                return f"\u274c \u0644\u0645 \u064a\u064f\u0639\u062b\u0631 \u0639\u0644\u0649 \u0627\u0644\u0645\u062c\u0644\u062f `{path}`."
             lines = []
             for item in items:
-                icon = "📁" if item.get("type") == "dir" else "📄"
+                icon = "\U0001f4c1" if item.get("type") == "dir" else "\U0001f4c4"
                 lines.append(f"{icon} {item['name']}")
-            return f"📂 محتويات `{'/' if not path else path}`:\n" + "\n".join(lines)
+            return f"\U0001f4c2 \u0645\u062d\u062a\u0648\u064a\u0627\u062a `{'/' if not path else path}`:\n" + "\n".join(lines)
         except Exception as e:
-            return f"❌ خطأ list_files: {e}"
+            return f"\u274c \u062e\u0637\u0623 list_files: {e}"
 
     elif tool == "answer":
         return action.get("text", "")
 
     else:
-        return f"⚠️ أداة غير معروفة: `{tool}`"
+        return f"\u26a0\ufe0f \u0623\u062f\u0627\u0629 \u063a\u064a\u0631 \u0645\u0639\u0631\u0648\u0641\u0629: `{tool}`"
 
 
 def react_loop(
@@ -438,15 +395,18 @@ def react_loop(
     max_steps: int = 6,
 ) -> tuple:
     """
-    دورة ReAct مع SmartAPIClient:
-      Thought → Action (JSON) → Observation → ... → answer
-    ترجع (final_reply: str, total_tokens: int)
+    \u062f\u0648\u0631\u0629 ReAct \u0645\u0639 SmartAPIClient:
+      Thought \u2192 Action (JSON) \u2192 Observation \u2192 ... \u2192 answer
+    \u062a\u0631\u062c\u0639 (final_reply: str, total_tokens: int)
+
+    v5.4.1: \u0639\u0646\u062f \u063a\u064a\u0627\u0628 \u0627\u0644\u0623\u062f\u0627\u0629 (action is None)\u060c \u0644\u0627 \u064a\u0646\u062a\u0647\u064a \u0627\u0644\u0644\u0648\u0628 \u0628\u0644 \u064a\u0637\u0644\u0628
+    \u0645\u0646 \u0627\u0644\u0646\u0645\u0648\u0630\u062c \u062a\u0648\u0636\u064a\u062d \u0645\u0627 \u0625\u0630\u0627 \u0627\u0646\u062a\u0647\u0649 \u0623\u0645 \u064a\u062c\u0628 \u0627\u0644\u0645\u062a\u0627\u0628\u0639\u0629.
     """
     total_tokens = 0
     log_steps    = []
 
     for step in range(1, max_steps + 1):
-        print(f"[ReAct] خطوة {step}/{max_steps}")
+        print(f"[ReAct] \u062e\u0637\u0648\u0629 {step}/{max_steps}")
 
         try:
             resp = smart_client.chat_completions_create(
@@ -460,16 +420,23 @@ def react_loop(
             tokens = getattr(resp.usage, "total_tokens", 0)
             total_tokens += tokens
         except Exception as e:
-            # الخطأ مسجَّل بالفعل في ErrorMonitor داخل SmartAPIClient
-            return f"⚠️ خطأ ReAct API (خطوة {step}): {e}", total_tokens
+            return f"\u26a0\ufe0f \u062e\u0637\u0623 ReAct API (\u062e\u0637\u0648\u0629 {step}): {e}", total_tokens
 
-        print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
+        print(f"[ReAct] \u0631\u062f \u0627\u0644\u0646\u0645\u0648\u0630\u062c:\n{raw[:300]}...")
 
         action = parse_tool_call(raw)
 
+        # ============================================================
+        # إصلاح v5.4.1: بدل من إنهاء الحلقة، نطلب من النموذج المتابعة
+        # ============================================================
         if action is None:
-            log_steps.append(f"**Step {step}:** (no tool) {raw[:200]}…")
-            return raw, total_tokens
+            print(f"[ReAct] \u0644\u0645 \u062a\u064f\u0639\u062b\u0631 \u0639\u0644\u0649 \u0623\u062f\u0627\u0629 \u0641\u064a \u0627\u0644\u062e\u0637\u0648\u0629 {step}\u060c \u0637\u0644\u0628 \u0627\u0644\u062a\u0648\u0636\u064a\u062d.")
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({
+                "role": "user",
+                "content": "\u0644\u0645 \u0623\u062a\u0644\u0642\u064e\u0651 \u0623\u062f\u0627\u0629. \u0647\u0644 \u0627\u0646\u062a\u0647\u064a\u062a \u0645\u0646 \u0627\u0644\u0645\u0647\u0645\u0629\u061f \u0625\u0630\u0627 \u0646\u0639\u0645 \u0627\u0633\u062a\u062e\u062f\u0645 tool=answer\u060c \u0648\u0625\u0644\u0627 \u062a\u0627\u0628\u0639 \u0645\u0639 \u0627\u0644\u0623\u062f\u0627\u0629 \u0627\u0644\u062a\u0627\u0644\u064a\u0629."
+            })
+            continue  # تابع الحلقة بدل من إنهائها
 
         tool_name = action.get("tool", "")
         log_steps.append(f"**Step {step}:** tool=`{tool_name}`")
@@ -485,7 +452,7 @@ def react_loop(
         messages.append({"role": "user",       "content": f"Observation: {observation}"})
 
     # بلغنا max_steps — نطلب رداً نهائياً
-    messages.append({"role": "user", "content": "لقد انتهت جميع الخطوات. أجب بشكل نهائي باستخدام tool=answer."})
+    messages.append({"role": "user", "content": "\u0644\u0642\u062f \u0627\u0646\u062a\u0647\u062a \u062c\u0645\u064a\u0639 \u0627\u0644\u062e\u0637\u0648\u0627\u062a. \u0623\u062c\u0628 \u0628\u0634\u0643\u0644 \u0646\u0647\u0627\u0626\u064a \u0628\u0627\u0633\u062a\u062e\u062f\u0627\u0645 tool=answer."})
     try:
         resp = smart_client.chat_completions_create(
             step=max_steps + 1,
@@ -501,7 +468,7 @@ def react_loop(
             return action.get("text", raw), total_tokens
         return raw, total_tokens
     except Exception as e:
-        return f"⚠️ خطأ ReAct نهايي: {e}", total_tokens
+        return f"\u26a0\ufe0f \u062e\u0637\u0623 ReAct \u0646\u0647\u0627\u064a\u064a: {e}", total_tokens
 
 
 # ===================================================================
@@ -524,7 +491,7 @@ class MemoryManager:
         if raw:
             try:
                 self._issue_data = json.loads(raw)
-                print(f"[Memory] issue #{self.issue_number} — {len(self._issue_data.get('turns',[]))} turn(s)")
+                print(f"[Memory] issue #{self.issue_number} \u2014 {len(self._issue_data.get('turns',[]))} turn(s)")
             except json.JSONDecodeError:
                 self._issue_data = self._empty_issue()
         else:
@@ -539,7 +506,7 @@ class MemoryManager:
         recent  = data.get("turns", [])[-MAX_MEMORY_TURNS:]
         messages = [{"role": "system", "content": system_prompt}]
         if recent:
-            messages[0]["content"] += f"\n\n## سياق آخر {len(recent)} تفاعل:\n"
+            messages[0]["content"] += f"\n\n## \u0633\u064a\u0627\u0642 \u0622\u062e\u0631 {len(recent)} \u062a\u0641\u0627\u0639\u0644:\n"
         for t in recent:
             messages.append({"role": "user",     "content": t["user"]})
             messages.append({"role": "assistant", "content": t["agent"]})
@@ -567,7 +534,7 @@ class MemoryManager:
                 f"memory(issue-{self.issue_number}): turn {len(turns)}",
             )
         except Exception as e:
-            print(f"[Memory] ⚠ {e}")
+            print(f"[Memory] \u26a0 {e}")
         try:
             existing = read_file_from_github(self.owner, self.repo, self.log_path) or ""
             entry    = json.dumps({"ts": self._now(), "issue": self.issue_number,
@@ -577,7 +544,7 @@ class MemoryManager:
                                 existing.rstrip("\n") + "\n" + entry + "\n",
                                 f"memory(log): issue-{self.issue_number}")
         except Exception as e:
-            print(f"[Memory] log ⚠ {e}")
+            print(f"[Memory] log \u26a0 {e}")
 
     @staticmethod
     def _now():
@@ -588,8 +555,8 @@ class MemoryManager:
 # SelfEvaluator
 # ===================================================================
 
-EVAL_SYSTEM_PROMPT = """أنت مُقيّم موضوعي. قيّم الرد من 0 إلى 10.
-أجب بـ JSON فقط:
+EVAL_SYSTEM_PROMPT = """\u0623\u0646\u062a \u0645\u064f\u0642\u064a\u0651\u0645 \u0645\u0648\u0636\u0648\u0639\u064a. \u0642\u064a\u0651\u0645 \u0627\u0644\u0631\u062f \u0645\u0646 0 \u0625\u0644\u0649 10.
+\u0623\u062c\u0628 \u0628\u0640 JSON \u0641\u0642\u0637:
 {"score":<0-10>,"issues":[],"improvements":[],"refined_prompt_addition":""}"""
 
 
@@ -607,7 +574,7 @@ class SelfEvaluator:
                 model=self.model_name,
                 messages=[
                     {"role": "system", "content": EVAL_SYSTEM_PROMPT},
-                    {"role": "user",   "content": f"الطلب:\n{user_msg}\n\nالرد:\n{agent_reply}"},
+                    {"role": "user",   "content": f"\u0627\u0644\u0637\u0644\u0628:\n{user_msg}\n\n\u0627\u0644\u0631\u062f:\n{agent_reply}"},
                 ],
                 temperature=0.1, max_tokens=256,
             )
@@ -615,7 +582,7 @@ class SelfEvaluator:
             m   = re.search(r"\{.*\}", raw, re.DOTALL)
             return json.loads(m.group()) if m else {"score": 10, "issues": [], "improvements": [], "refined_prompt_addition": ""}
         except Exception as e:
-            print(f"[SelfEval] ⚠ {e}")
+            print(f"[SelfEval] \u26a0 {e}")
             return {"score": 10, "issues": [], "improvements": [], "refined_prompt_addition": ""}
 
     def refine_system_prompt(self, original_prompt, eval_result):
@@ -623,10 +590,10 @@ class SelfEvaluator:
         if eval_result.get("refined_prompt_addition", "").strip():
             lines.append(eval_result["refined_prompt_addition"])
         if eval_result.get("issues"):
-            lines.append("تجنّب: " + "؛ ".join(eval_result["issues"]))
+            lines.append("\u062a\u062c\u0646\u0651\u0628: " + "\u061b ".join(eval_result["issues"]))
         if not lines:
             return original_prompt
-        return original_prompt + "\n\n## توجيهات تلقائية:\n" + "\n".join(f"- {l}" for l in lines)
+        return original_prompt + "\n\n## \u062a\u0648\u062c\u064a\u0647\u0627\u062a \u062a\u0644\u0642\u0627\u0626\u064a\u0629:\n" + "\n".join(f"- {l}" for l in lines)
 
     def log_evaluation(self, issue_number, turn, user_msg, score, model_name, attempt, improved):
         entry    = json.dumps({"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -639,7 +606,7 @@ class SelfEvaluator:
                                 existing.rstrip("\n") + "\n" + entry + "\n",
                                 f"eval(log): score-{score}")
         except Exception as e:
-            print(f"[SelfEval] ⚠ log: {e}")
+            print(f"[SelfEval] \u26a0 log: {e}")
 
     def update_prompt_stats(self, score, improved):
         raw   = read_file_from_github(self.owner, self.repo, PROMPT_STATS_PATH)
@@ -660,7 +627,7 @@ class SelfEvaluator:
                                 json.dumps(stats, ensure_ascii=False, indent=2),
                                 f"eval(stats): avg={stats['avg_score']}")
         except Exception as e:
-            print(f"[SelfEval] ⚠ stats: {e}")
+            print(f"[SelfEval] \u26a0 stats: {e}")
 
 
 # ===================================================================
@@ -702,7 +669,7 @@ def extract_code_from_reply(reply):
 # ===================================================================
 
 def load_system_prompt(filepath):
-    default = "أنت Selfe، وكيل ذكاء اصطناعي متخصص في تطوير البرمجيات."
+    default = "\u0623\u0646\u062a Selfe\u060c \u0648\u0643\u064a\u0644 \u0630\u0643\u0627\u0621 \u0627\u0635\u0637\u0646\u0627\u0639\u064a \u0645\u062a\u062e\u0635\u0635 \u0641\u064a \u062a\u0637\u0648\u064a\u0631 \u0627\u0644\u0628\u0631\u0645\u062c\u064a\u0627\u062a."
     if not os.path.exists(filepath):
         return default
     lines = []
@@ -715,7 +682,7 @@ def load_system_prompt(filepath):
 
 def load_models(filepath):
     if not os.path.exists(filepath):
-        print(f"[ERROR] لم يُعثر على: {filepath}")
+        print(f"[ERROR] \u0644\u0645 \u064a\u064f\u0639\u062b\u0631 \u0639\u0644\u0649: {filepath}")
         sys.exit(1)
     models = []
     with open(filepath, "r", encoding="utf-8") as f:
@@ -728,18 +695,18 @@ def load_models(filepath):
             if provider.lower() in PROVIDER_CONFIG:
                 models.append({"name": name, "provider": provider.lower()})
     if not models:
-        print("[ERROR] لا توجد نماذج")
+        print("[ERROR] \u0644\u0627 \u062a\u0648\u062c\u062f \u0646\u0645\u0627\u0630\u062c")
         sys.exit(1)
     return models
 
 
 def detect_temperature(message):
     msg = message.lower()
-    if any(k in msg for k in ["كود","code","دالة","function","اكتب","برمجة","debug","script","/push"]):
+    if any(k in msg for k in ["\u0643\u0648\u062f","code","\u062f\u0627\u0644\u0629","function","\u0627\u0643\u062a\u0628","\u0628\u0631\u0645\u062c\u0629","debug","script","/push"]):
         return 0.2
-    if any(k in msg for k in ["قصيدة","poem","اقتراح","فكرة","إبداع","تصميم","قصة"]):
+    if any(k in msg for k in ["\u0642\u0635\u064a\u062f\u0629","poem","\u0627\u0642\u062a\u0631\u0627\u062d","\u0641\u0643\u0631\u0629","\u0625\u0628\u062f\u0627\u0639","\u062a\u0635\u0645\u064a\u0645","\u0642\u0635\u0629"]):
         return 0.9
-    if any(k in msg for k in ["ما هو","what is","اشرح","explain","فرق","difference"]):
+    if any(k in msg for k in ["\u0645\u0627 \u0647\u0648","what is","\u0627\u0634\u0631\u062d","explain","\u0641\u0631\u0642","difference"]):
         return 0.5
     return 0.7
 
@@ -753,10 +720,10 @@ def write_output(reply):
     print(reply)
 
 
-PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
-اكتب الكود فقط داخل code fence:
+PUSH_SYSTEM_PROMPT = """\u0623\u0646\u062a Selfe\u060c \u0648\u0643\u064a\u0644 \u0628\u0631\u0645\u062c\u0629.
+\u0627\u0643\u062a\u0628 \u0627\u0644\u0643\u0648\u062f \u0641\u0642\u0637 \u062f\u0627\u062e\u0644 code fence:
 ```python
-# الكود هنا
+# \u0627\u0644\u0643\u0648\u062f \u0647\u0646\u0627
 ```"""
 
 
@@ -765,11 +732,11 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v5.4.0] تشغيل...")
+    print("\n[Selfe Agent CI v5.4.1] \u062a\u0634\u063a\u064a\u0644...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
-        write_output("⚠️ لم يتم استقبال أي رسالة.")
+        write_output("\u26a0\ufe0f \u0644\u0645 \u064a\u062a\u0645 \u0627\u0633\u062a\u0642\u0628\u0627\u0644 \u0623\u064a \u0631\u0633\u0627\u0644\u0629.")
         sys.exit(0)
 
     gh_repo      = os.environ.get("GITHUB_REPOSITORY", "/")
@@ -779,7 +746,7 @@ def main():
     models = load_models(MODELS_FILE)
     idx    = int(os.environ.get("MODEL_INDEX", "1")) - 1
     model  = models[idx] if idx < len(models) else models[0]
-    print(f"[CI] النموذج: {model['name']} | {model['provider']} | Issue #{issue_number}")
+    print(f"[CI] \u0627\u0644\u0646\u0645\u0648\u0630\u062c: {model['name']} | {model['provider']} | Issue #{issue_number}")
 
     all_keys = {
         p: [os.environ.get(v, "").strip() for v in cfg["secret_vars"] if os.environ.get(v, "").strip()]
@@ -787,7 +754,7 @@ def main():
     }
     pkeys = all_keys.get(model["provider"], [])
     if not pkeys:
-        write_output(f"⚠️ لا يوجد مفتاح API لـ: {model['provider']}")
+        write_output(f"\u26a0\ufe0f \u0644\u0627 \u064a\u0648\u062c\u062f \u0645\u0641\u062a\u0627\u062d API \u0644\u0640: {model['provider']}")
         sys.exit(1)
 
     memory = MemoryManager(owner, repo, issue_number)
@@ -795,20 +762,19 @@ def main():
     try:
         from openai import OpenAI
     except ImportError:
-        write_output("⚠️ مكتبة openai غير مثبتَّتة.")
+        write_output("\u26a0\ufe0f \u0645\u0643\u062a\u0628\u0629 openai \u063a\u064a\u0631 \u0645\u062b\u0628\u062a\u064e\u0651\u062a\u0629.")
         sys.exit(1)
 
     cfg     = PROVIDER_CONFIG[model["provider"]]
 
-    # ── إنشاء ErrorMonitor و SmartAPIClient ──────────────────
     monitor      = ErrorMonitor(owner, repo, issue_number, model["name"])
     smart_client = SmartAPIClient(pkeys, cfg["base_url"], model["name"], monitor)
     evaluator    = SelfEvaluator(owner, repo, smart_client, model["name"])
 
-    # ── /push ─────────────────────────────────────────────────
+    # ── /push ─────────────────────────────────────────────────────
     is_push, push_instruction = detect_push_command(msg)
     if is_push:
-        print(f"[CI] /push — {push_instruction}")
+        print(f"[CI] /push \u2014 {push_instruction}")
         filename = extract_filename(push_instruction)
         for attempt in range(MAX_RETRIES):
             try:
@@ -829,9 +795,9 @@ def main():
                     f"feat({filename}): generated by Selfe Agent via /push",
                 )
                 reply = (
-                    f"✅ **تم دفع الملف بنجاح!**\n\n"
-                    f"📄 **الملف:** `{filename}`\n"
-                    f"🔗 **الـ commit:** {commit_url}\n\n"
+                    f"\u2705 **\u062a\u0645 \u062f\u0641\u0639 \u0627\u0644\u0645\u0644\u0641 \u0628\u0646\u062c\u0627\u062d!**\n\n"
+                    f"\U0001f4c4 **\u0627\u0644\u0645\u0644\u0641:** `{filename}`\n"
+                    f"\U0001f517 **\u0627\u0644\u0640 commit:** {commit_url}\n\n"
                     f"```\n{clean_code[:1500]}\n```"
                 )
                 write_output(reply)
@@ -841,12 +807,12 @@ def main():
             except Exception as e:
                 if attempt >= MAX_RETRIES - 1:
                     monitor.flush_to_github()
-                    write_output(f"⚠️ خطأ /push: {e}")
+                    write_output(f"\u26a0\ufe0f \u062e\u0637\u0623 /push: {e}")
                     sys.exit(1)
 
-    # ── ReAct Loop (مهام معقدة) + SelfEval + Memory ──────────
+    # ── ReAct Loop (مهام معقدة) + SelfEval + Memory ──────
     if is_complex_task(msg):
-        print(f"[CI] ✨ مهمة معقدة → تفعيل ReAct Loop")
+        print(f"[CI] \u2728 \u0645\u0647\u0645\u0629 \u0645\u0639\u0642\u062f\u0629 \u2192 \u062a\u0641\u0639\u064a\u0644 ReAct Loop")
         base_sp      = load_system_prompt(SYSTEM_PROMPT_FILE)
         data         = memory.load_issue_memory()
         current_turn = len(data.get("turns", [])) + 1
@@ -861,7 +827,7 @@ def main():
         print(f"[SelfEval/ReAct] {score}/10")
 
         if score < EVAL_THRESHOLD:
-            print(f"[SelfEval/ReAct] ⚠ score={score} < {EVAL_THRESHOLD} → إعادة محاولة بـ refined prompt")
+            print(f"[SelfEval/ReAct] \u26a0 score={score} < {EVAL_THRESHOLD} \u2192 \u0625\u0639\u0627\u062f\u0629 \u0645\u062d\u0627\u0648\u0644\u0629 \u0628\u0640 refined prompt")
             refined_sp = evaluator.refine_system_prompt(
                 REACT_SYSTEM_PROMPT + "\n\n" + base_sp, eval_result
             )
@@ -871,7 +837,7 @@ def main():
             )
             eval_result2 = evaluator.evaluate(msg, retry_reply)
             score2       = eval_result2.get("score", 10)
-            print(f"[SelfEval/ReAct] retry → {score2}/10")
+            print(f"[SelfEval/ReAct] retry \u2192 {score2}/10")
 
             if score2 > score:
                 final_reply   = retry_reply
@@ -885,7 +851,7 @@ def main():
         evaluator.update_prompt_stats(score, improved=(score < EVAL_THRESHOLD))
 
         if score < EVAL_THRESHOLD:
-            final_reply += f"\n\n---\n> ⚠️ *أفضل تقييم ذاتي: {score}/10*"
+            final_reply += f"\n\n---\n> \u26a0\ufe0f *\u0623\u0641\u0636\u0644 \u062a\u0642\u064a\u064a\u0645 \u0630\u0627\u062a\u064a: {score}/10*"
 
         write_output(final_reply)
         memory.save_turn(
@@ -893,10 +859,10 @@ def main():
             success=(score >= EVAL_THRESHOLD)
         )
         monitor.flush_to_github()
-        print(f"[CI] ReAct اكتمل ✔  (score={score})")
+        print(f"[CI] ReAct \u0627\u0643\u062a\u0645\u0644 \u2714  (score={score})")
         return
 
-    # ── وضع عادي (Single-shot) + SelfEval + Memory ────────────
+    # ── وضع عادي (Single-shot) + SelfEval + Memory ────
     base_system_prompt    = load_system_prompt(SYSTEM_PROMPT_FILE)
     temp                  = detect_temperature(msg)
     current_system_prompt = base_system_prompt
@@ -910,7 +876,7 @@ def main():
 
     for eval_attempt in range(MAX_SELF_EVAL_RETRIES + 1):
         if eval_attempt > 0:
-            print(f"[SelfEval] 🔄 إعادة محاولة {eval_attempt}...")
+            print(f"[SelfEval] \U0001f504 \u0625\u0639\u0627\u062f\u0629 \u0645\u062d\u0627\u0648\u0644\u0629 {eval_attempt}...")
 
         messages = memory.build_messages(current_system_prompt, msg)
         reply    = None
@@ -928,7 +894,7 @@ def main():
             tokens = getattr(resp.usage, "total_tokens", 0)
         except Exception as e:
             monitor.flush_to_github()
-            write_output(f"⚠️ خطأ: {e}")
+            write_output(f"\u26a0\ufe0f \u062e\u0637\u0623: {e}")
             memory.save_turn(msg, str(e), model["name"], 0, temp, False)
             sys.exit(1)
 
@@ -956,15 +922,15 @@ def main():
             final_reply = best_reply
 
     if not final_reply:
-        final_reply = best_reply or "⚠️ فشل الوكيل."
+        final_reply = best_reply or "\u26a0\ufe0f \u0641\u0634\u0644 \u0627\u0644\u0648\u0643\u064a\u0644."
 
     if best_score < EVAL_THRESHOLD:
-        final_reply += f"\n\n---\n> ⚠️ *أفضل تقييم ذاتي: {best_score}/10*"
+        final_reply += f"\n\n---\n> \u26a0\ufe0f *\u0623\u0641\u0636\u0644 \u062a\u0642\u064a\u064a\u0645 \u0630\u0627\u062a\u064a: {best_score}/10*"
 
     write_output(final_reply)
     memory.save_turn(msg, final_reply, model["name"], final_tokens, temp, True)
     monitor.flush_to_github()
-    print("[CI] اكتمل ✔")
+    print("[CI] \u0627\u0643\u062a\u0645\u0644 \u2714")
 
 
 if __name__ == "__main__":
