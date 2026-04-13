@@ -7,6 +7,8 @@
 
 prompt-engineer | https://raw.githubusercontent.com/bahoma31-eng/autonomous-agent/main/skills/01-ai-and-agents/06-prompt-engineering/prompt-engineer/SKILL.md
 
+agent-orchestration-improve-agent | https://raw.githubusercontent.com/bahoma31-eng/autonomous-agent/main/skills/01-ai-and-agents/01-autonomous-agents/agent-orchestration-improve-agent/SKILL.md
+
 # أضف مهارات إضافية بنفس الصيغة:
 # code-reviewer   | https://raw.githubusercontent.com/.../SKILL.md
 # data-analyst    | https://raw.githubusercontent.com/.../SKILL.md
