@@ -1,6 +1,10 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v6.0.0
+# agent_ci.py — Selfe Agent v6.1.0
 # إصلاح شامل: فصل طبقات الفشل + Retry ذكي + ReAct محسّن
+# v6.1.0: 3 حلول لاستنزاف حصة API:
+#   1. كشف quota_exceeded وتخطي المفتاح كلياً
+#   2. تدوير تلقائي بين مزودين (Gemini → Groq) عند 429/quota
+#   3. وضع Fallback: Groq كامل عند فشل Gemini بالكامل
 # =============================================================
 
 import os
@@ -39,6 +43,22 @@ PROVIDER_CONFIG = {
     },
 }
 
+# نموذج Groq الاحتياطي المستخدم عند الـ Fallback الكامل
+GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile"
+
+# عبارات تدل على استنزاف الحصة كلياً (ليس مجرد rate limit مؤقت)
+QUOTA_EXHAUSTED_PATTERNS = [
+    "quota exceeded",
+    "quota_exceeded",
+    "resource_exhausted",
+    "you exceeded your current quota",
+    "billing",
+    "insufficient_quota",
+    "rate limit reached for requests per day",
+    "daily limit",
+    "monthly limit",
+]
+
 # ===================================================================
 # استراتيجية Retry المخصصة لكل كود HTTP
 # ===================================================================
@@ -59,6 +79,15 @@ def _compute_delay(strategy: dict, attempt: int) -> float:
     if mode == "linear":
         return base * (attempt + 1)
     return base  # fixed
+
+
+def _is_quota_exhausted(error_str: str) -> bool:
+    """
+    الحل #1: كشف استنزاف الحصة الكاملة.
+    يميّز بين rate limit مؤقت (429 عادي) وحصة منتهية فعلاً.
+    """
+    low = error_str.lower()
+    return any(p in low for p in QUOTA_EXHAUSTED_PATTERNS)
 
 
 # ===================================================================
@@ -100,21 +129,24 @@ class ErrorMonitor:
         error_str      = str(error)
         code, severity = self._classify(error_str)
         strategy       = RETRY_STRATEGY.get(code, RETRY_STRATEGY["default"])
+        quota_exhausted = _is_quota_exhausted(error_str)
         entry = {
-            "ts":          datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "severity":    severity,
-            "error_code":  code,
-            "model":       self.model_name,
-            "issue":       self.issue_number,
-            "step":        step,
-            "context":     context,
-            "message":     error_str[:500],
-            "rotate_key":  strategy["rotate_key"],
-            "retry_later": code in (429, 503),
-            "max_attempts": strategy["max_attempts"],
+            "ts":             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "severity":       severity,
+            "error_code":     code,
+            "model":          self.model_name,
+            "issue":          self.issue_number,
+            "step":           step,
+            "context":        context,
+            "message":        error_str[:500],
+            "rotate_key":     strategy["rotate_key"],
+            "retry_later":    code in (429, 503),
+            "max_attempts":   strategy["max_attempts"],
+            "quota_exhausted": quota_exhausted,
         }
         icon = {"INFO": "ℹ", "WARNING": "⚠", "ERROR": "✖", "CRITICAL": "🔴"}.get(severity, "?")
-        print(f"[ErrorMonitor] {icon} [{severity}] code={code} ctx={context} → {error_str[:120]}")
+        quota_tag = " [QUOTA_EXHAUSTED]" if quota_exhausted else ""
+        print(f"[ErrorMonitor] {icon} [{severity}]{quota_tag} code={code} ctx={context} → {error_str[:120]}")
         self._buffer.append(entry)
         return entry
 
@@ -136,68 +168,154 @@ class ErrorMonitor:
 
 
 # ===================================================================
-# SmartAPIClient — طبقة الشبكة فقط (لا تعرف منطق المهام)
+# SmartAPIClient — v6.1.0
+# الحل #1: كشف quota_exhausted → تخطي المفتاح فوراً
+# الحل #2: تدوير تلقائي بين مزودين عند استنزاف كل مفاتيح مزود
+# الحل #3: Fallback كامل إلى Groq عند فشل المزود الأساسي
 # ===================================================================
 
 class SmartAPIClient:
     """
     يتولى حصراً: إعادة المحاولة عند أخطاء الشبكة/API.
-    لا يعرف شيئاً عن منطق ReAct أو الأدوات.
+    v6.1.0:
+      - كشف quota_exhausted → تخطي المفتاح فوراً (لا تنتظر)
+      - تدوير بين مزودين عند استنزاف كل مفاتيح المزود الحالي
+      - Fallback إلى Groq عند فشل Gemini بالكامل
     """
 
-    def __init__(self, keys: List[str], base_url: str, model_name: str, monitor: ErrorMonitor):
+    def __init__(
+        self,
+        keys: List[str],
+        base_url: str,
+        model_name: str,
+        monitor: "ErrorMonitor",
+        fallback_keys: Optional[List[str]] = None,
+        fallback_base_url: Optional[str] = None,
+        fallback_model: Optional[str] = None,
+    ):
         from openai import OpenAI
-        self._OpenAI    = OpenAI
-        self.keys       = keys
-        self.base_url   = base_url
-        self.model_name = model_name
-        self.monitor    = monitor
-        self._key_idx   = 0
-        self._client    = self._make_client()
+        self._OpenAI          = OpenAI
+        self.keys             = keys
+        self.base_url         = base_url
+        self.model_name       = model_name
+        self.monitor          = monitor
+        self._key_idx         = 0
+        self._exhausted_keys: set = set()
+
+        # الحل #3 — Groq Fallback
+        self.fallback_keys      = fallback_keys or []
+        self.fallback_base_url  = fallback_base_url
+        self.fallback_model     = fallback_model or GROQ_FALLBACK_MODEL
+        self._using_fallback    = False
+
+        self._client = self._make_client()
 
     def _make_client(self):
         from openai import OpenAI
-        return OpenAI(api_key=self.keys[self._key_idx], base_url=self.base_url)
+        if self._using_fallback:
+            return self._OpenAI(
+                api_key=self.fallback_keys[0],
+                base_url=self.fallback_base_url,
+            )
+        return self._OpenAI(api_key=self.keys[self._key_idx], base_url=self.base_url)
 
     def _rotate_key(self) -> bool:
-        if len(self.keys) <= 1:
-            print("[SmartAPIClient] ⚠ مفتاح واحد فقط، لا يوجد مفتاح بديل.")
+        """تدوير المفاتيح مع تخطي المفاتيح المستنزفة."""
+        available = [i for i in range(len(self.keys)) if i not in self._exhausted_keys]
+        if not available:
+            print("[SmartAPIClient] 🔴 جميع المفاتيح مستنزفة.")
             return False
-        self._key_idx = (self._key_idx + 1) % len(self.keys)
+        # اختر المفتاح التالي المتاح
+        next_keys = [i for i in available if i != self._key_idx]
+        if not next_keys:
+            return False
+        self._key_idx = next_keys[0]
         self._client  = self._make_client()
         print(f"[SmartAPIClient] 🔄 تدوير المفتاح → مفتاح #{self._key_idx + 1}")
         return True
 
+    def _activate_fallback(self) -> bool:
+        """
+        الحل #2 + #3: تفعيل Groq كـ Fallback عند استنزاف كل مفاتيح Gemini.
+        """
+        if not self.fallback_keys or not self.fallback_base_url:
+            print("[SmartAPIClient] ⚠ لا يوجد مزود fallback مُعرَّف.")
+            return False
+        if self._using_fallback:
+            return False
+        self._using_fallback = True
+        self._client = self._make_client()
+        print(
+            f"[SmartAPIClient] 🔀 تفعيل Fallback → {self.fallback_model} "
+            f"(Groq) بعد استنزاف جميع مفاتيح Gemini"
+        )
+        return True
+
+    @property
+    def active_model(self) -> str:
+        """اسم النموذج الفعلي المستخدم حالياً (قد يكون fallback)."""
+        return self.fallback_model if self._using_fallback else self.model_name
+
     def chat_completions_create(self, step: int = 0, **kwargs) -> Any:
         """
-        يحاول الاتصال بـ API مع إعادة المحاولة الذكية حسب كود الخطأ.
-        يعيد النتيجة فقط عند النجاح، أو يرفع الاستثناء بعد استنزاف كل المحاولات.
-        react_loop لا يرى أخطاء الشبكة — هذا الكلاس يحلها داخلياً.
+        يحاول الاتصال بـ API مع إعادة المحاولة الذكية.
+        v6.1.0:
+          - quota_exhausted → تخطي المفتاح فوراً بدون انتظار
+          - استنزاف كل المفاتيح → تفعيل Groq Fallback تلقائياً
         """
         last_error = None
         attempt    = 0
+
+        # ضمان استخدام النموذج الصحيح (fallback أو أصلي)
+        kwargs["model"] = self.active_model
 
         while True:
             try:
                 return self._client.chat.completions.create(**kwargs)
             except Exception as e:
-                entry    = self.monitor.log(e, context="chat_completions_create", step=step)
+                entry      = self.monitor.log(e, context="chat_completions_create", step=step)
                 last_error = e
-                code     = entry["error_code"]
-                severity = entry["severity"]
+                code       = entry["error_code"]
+                severity   = entry["severity"]
+                quota_ex   = entry.get("quota_exhausted", False)
 
                 # خطأ حرج → لا تعيد المحاولة
                 if severity == SEVERITY_CRITICAL:
                     raise
 
+                # الحل #1: quota_exhausted → تخطي المفتاح الحالي فوراً
+                if quota_ex and not self._using_fallback:
+                    print(f"[SmartAPIClient] 🚫 مفتاح #{self._key_idx + 1} مستنزف كلياً — تخطٍّ فوري.")
+                    self._exhausted_keys.add(self._key_idx)
+                    rotated = self._rotate_key()
+                    if not rotated:
+                        # الحل #2 + #3: كل المفاتيح مستنزفة → Groq Fallback
+                        activated = self._activate_fallback()
+                        if activated:
+                            kwargs["model"] = self.active_model
+                            attempt = 0
+                            continue
+                        raise
+                    kwargs["model"] = self.active_model
+                    attempt = 0
+                    continue
+
                 strategy     = RETRY_STRATEGY.get(code, RETRY_STRATEGY["default"])
                 max_attempts = strategy["max_attempts"]
 
                 if attempt >= max_attempts - 1:
+                    # استنفاد محاولات هذا المزود → جرّب Fallback
+                    if not self._using_fallback:
+                        activated = self._activate_fallback()
+                        if activated:
+                            kwargs["model"] = self.active_model
+                            attempt = 0
+                            continue
                     break
 
-                if strategy["rotate_key"]:
+                if strategy["rotate_key"] and not self._using_fallback:
                     self._rotate_key()
+                    kwargs["model"] = self.active_model
 
                 delay = _compute_delay(strategy, attempt)
                 print(f"[SmartAPIClient] ⏳ محاولة {attempt+1}/{max_attempts} — انتظار {delay:.1f}s (code={code})")
@@ -261,7 +379,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/6.0.0",
+        "User-Agent": "selfe-agent/6.1.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -301,14 +419,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v6.0.0
-# إصلاحات شاملة:
-#   - فصل واضح: SmartAPIClient يعالج أخطاء الشبكة، react_loop يعالج منطق الأدوات
-#   - max_steps افتراضي = 10 (كان 6)
-#   - REACT_SYSTEM_PROMPT أكثر صرامة ووضوحاً
-#   - parse_tool_call يدعم JSON بدون code fence
-#   - أداة search_files جديدة
-#   - عداد فشل الأدوات مُحسَّن (حد = 3 بدل 2)
+# ReAct Loop — v6.1.0
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -370,23 +481,17 @@ REACT_KEYWORDS = [
 def is_complex_task(msg: str) -> bool:
     msg_lower = msg.lower()
     matched = sum(1 for kw in REACT_KEYWORDS if kw in msg_lower)
-    # عتبة مخفّضة: كلمة مفتاحية واحدة كافية لتفعيل ReAct
     return matched >= 1 or len(msg) > 200
 
 
 def parse_tool_call(text: str) -> Optional[dict]:
-    """
-    يحلّل استدعاء الأداة من النص.
-    يدعم: JSON داخل ```json ... ``` وJSON مباشر بدون code fence.
-    """
-    # 1. JSON داخل code fence (الصيغة المفضلة)
+    # 1. JSON داخل code fence
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-
     # 2. JSON مباشر يحتوي على "tool"
     m = re.search(r"(\{[^{}]*\"tool\"[^{}]*\})", text, re.DOTALL)
     if m:
@@ -394,7 +499,6 @@ def parse_tool_call(text: str) -> Optional[dict]:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-
     # 3. JSON متعدد الأسطر
     m = re.search(r"(\{[\s\S]*?\"tool\"[\s\S]*?\})", text)
     if m:
@@ -402,15 +506,10 @@ def parse_tool_call(text: str) -> Optional[dict]:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-
     return None
 
 
 def execute_tool(action: dict, owner: str, repo: str) -> str:
-    """
-    طبقة الأدوات — تعالج فشل الأدوات فقط (ملف غير موجود، GitHub API error).
-    لا تعرف شيئاً عن أخطاء الشبكة (تلك تعالجها SmartAPIClient).
-    """
     tool = action.get("tool", "")
 
     if tool == "push_file":
@@ -456,7 +555,6 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         if not query:
             return "❌ يجب تحديد query للبحث."
         try:
-            # بحث بسيط في جذر المستودع
             items = _github_request("GET", f"/repos/{owner}/{repo}/git/trees/main?recursive=1")
             tree  = items.get("tree", [])
             matches = [
@@ -485,28 +583,19 @@ def react_loop(
     repo: str,
     max_steps: int = 10,
 ) -> tuple:
-    """
-    دورة ReAct: Thought → Action (JSON) → Observation → ... → answer
-    ترجع (final_reply: str, total_tokens: int)
-
-    v6.0.0 — إصلاحات شاملة:
-    - SmartAPIClient يعالج أخطاء الشبكة داخلياً → react_loop لا يراها
-    - عند غياب الأداة: يطلب من النموذج المتابعة (لا يتوقف)
-    - عداد فشل الأدوات: حد = 3 محاولات قبل طلب مسار بديل
-    - max_steps = 10 افتراضياً (كان 6)
-    - رسائل التوجيه أوضح وأكثر تفصيلاً
-    """
     total_tokens  = 0
     tool_fail_count: Dict[str, int] = {}
-    no_tool_count = 0  # عداد ردود بدون أداة
+    no_tool_count = 0
 
     for step in range(1, max_steps + 1):
-        print(f"[ReAct] خطوة {step}/{max_steps}")
+        # استخدام النموذج الفعلي (قد تحوّل لـ Fallback)
+        active_model = smart_client.active_model
+        print(f"[ReAct] خطوة {step}/{max_steps} — نموذج: {active_model}")
 
         try:
             resp = smart_client.chat_completions_create(
                 step=step,
-                model=model_name,
+                model=active_model,
                 messages=messages,
                 temperature=0.2,
                 max_tokens=4096,
@@ -515,23 +604,18 @@ def react_loop(
             tokens = getattr(resp.usage, "total_tokens", 0)
             total_tokens += tokens
         except Exception as e:
-            # هذا يحدث فقط إذا استنفدت SmartAPIClient كل محاولاتها
             return f"⚠️ خطأ API لا يمكن التعافي منه (خطوة {step}): {e}", total_tokens
 
         print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
 
         action = parse_tool_call(raw)
 
-        # ── لا توجد أداة في الرد ──────────────────────────────
         if action is None:
             no_tool_count += 1
             print(f"[ReAct] لم تُعثر على أداة (المرة {no_tool_count}).")
-
             if no_tool_count >= 3:
-                # ثلاث ردود بدون أداة → اعتبر الرد نهائياً
                 print("[ReAct] ثلاثة ردود بدون أداة → اعتبار الرد نهائياً.")
                 return raw, total_tokens
-
             messages.append({"role": "assistant", "content": raw})
             messages.append({
                 "role": "user",
@@ -544,26 +628,21 @@ def react_loop(
             })
             continue
 
-        # إعادة تعيين عداد ردود بدون أداة
         no_tool_count = 0
         tool_name = action.get("tool", "")
 
-        # ── أداة answer = نهاية اللوب ────────────────────────
         if tool_name == "answer":
             final = action.get("text", raw)
             print(f"[ReAct] ✅ اكتمال في الخطوة {step}.")
             return final, total_tokens
 
-        # ── تنفيذ الأداة ──────────────────────────────────────
         observation = execute_tool(action, owner, repo)
         print(f"[ReAct] Observation: {observation[:200]}")
 
-        # ── عداد فشل الأدوات ──────────────────────────────────
         if observation.startswith("❌"):
             tool_fail_count[tool_name] = tool_fail_count.get(tool_name, 0) + 1
             fail_count = tool_fail_count[tool_name]
             print(f"[ReAct] ⚠ أداة `{tool_name}` فشلت {fail_count}/3.")
-
             if fail_count >= 3:
                 print(f"[ReAct] 🚫 `{tool_name}` فشلت 3 مرات — طلب مسار بديل.")
                 messages.append({"role": "assistant", "content": raw})
@@ -583,7 +662,6 @@ def react_loop(
         messages.append({"role": "assistant", "content": raw})
         messages.append({"role": "user", "content": f"Observation: {observation}"})
 
-    # ── استنفاد max_steps — طلب رد نهائي ──────────────────────
     print(f"[ReAct] ⚠ وصلنا للحد الأقصى ({max_steps} خطوات). طلب رد نهائي...")
     messages.append({
         "role": "user",
@@ -594,9 +672,10 @@ def react_loop(
         )
     })
     try:
+        active_model = smart_client.active_model
         resp = smart_client.chat_completions_create(
             step=max_steps + 1,
-            model=model_name,
+            model=active_model,
             messages=messages,
             temperature=0.3,
             max_tokens=2048,
@@ -711,7 +790,7 @@ class SelfEvaluator:
         try:
             resp = self.smart_client.chat_completions_create(
                 step=0,
-                model=self.model_name,
+                model=self.smart_client.active_model,
                 messages=[
                     {"role": "system", "content": EVAL_SYSTEM_PROMPT},
                     {"role": "user",   "content": f"الطلب:\n{user_msg}\n\nالرد:\n{agent_reply}"},
@@ -868,11 +947,12 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 
 
 # ===================================================================
-# main
+# main — v6.1.0
+# بناء SmartAPIClient مع Groq Fallback
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v6.0.0] تشغيل...")
+    print("\n[Selfe Agent CI v6.1.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
@@ -897,6 +977,18 @@ def main():
         write_output(f"⚠️ لا يوجد مفتاح API لـ: {model['provider']}")
         sys.exit(1)
 
+    # ── الحل #3: تجهيز Groq Fallback إذا كان المزود الأصلي Gemini ──
+    groq_keys     = all_keys.get("groq", [])
+    groq_base_url = PROVIDER_CONFIG["groq"]["base_url"]
+    fallback_keys      = groq_keys if model["provider"] == "gemini" and groq_keys else []
+    fallback_base_url  = groq_base_url if fallback_keys else None
+    fallback_model_name = GROQ_FALLBACK_MODEL if fallback_keys else None
+
+    if fallback_keys:
+        print(f"[CI] ✅ Groq Fallback جاهز ({GROQ_FALLBACK_MODEL})")
+    else:
+        print("[CI] ⚠ لا يوجد Groq Fallback (GROQ_API_KEY غير موجود أو المزود الأصلي هو Groq)")
+
     memory = MemoryManager(owner, repo, issue_number)
 
     try:
@@ -907,8 +999,16 @@ def main():
 
     cfg          = PROVIDER_CONFIG[model["provider"]]
     monitor      = ErrorMonitor(owner, repo, issue_number, model["name"])
-    smart_client = SmartAPIClient(pkeys, cfg["base_url"], model["name"], monitor)
-    evaluator    = SelfEvaluator(owner, repo, smart_client, model["name"])
+    smart_client = SmartAPIClient(
+        keys=pkeys,
+        base_url=cfg["base_url"],
+        model_name=model["name"],
+        monitor=monitor,
+        fallback_keys=fallback_keys,
+        fallback_base_url=fallback_base_url,
+        fallback_model=fallback_model_name,
+    )
+    evaluator = SelfEvaluator(owner, repo, smart_client, model["name"])
 
     # ── /push ─────────────────────────────────────────────────────
     is_push, push_instruction = detect_push_command(msg)
@@ -920,7 +1020,7 @@ def main():
             try:
                 resp = smart_client.chat_completions_create(
                     step=0,
-                    model=model["name"],
+                    model=smart_client.active_model,
                     messages=[
                         {"role": "system", "content": PUSH_SYSTEM_PROMPT},
                         {"role": "user",   "content": push_instruction},
@@ -950,7 +1050,7 @@ def main():
                     write_output(f"⚠️ خطأ /push: {e}")
                     sys.exit(1)
 
-    # ── ReAct Loop (جميع المهام الآن — عتبة مخفّضة) ──────────────
+    # ── ReAct Loop ─────────────────────────────────────────────────
     if is_complex_task(msg):
         print(f"[CI] ✨ تفعيل ReAct Loop")
         base_sp      = load_system_prompt(SYSTEM_PROMPT_FILE)
@@ -959,7 +1059,7 @@ def main():
 
         messages = memory.build_messages(REACT_SYSTEM_PROMPT + "\n\n" + base_sp, msg)
         final_reply, total_tokens = react_loop(
-            smart_client, model["name"], messages, owner, repo, max_steps=10
+            smart_client, smart_client.active_model, messages, owner, repo, max_steps=10
         )
 
         eval_result = evaluator.evaluate(msg, final_reply)
@@ -973,7 +1073,7 @@ def main():
             )
             messages2 = memory.build_messages(refined_sp, msg)
             retry_reply, retry_tokens = react_loop(
-                smart_client, model["name"], messages2, owner, repo, max_steps=10
+                smart_client, smart_client.active_model, messages2, owner, repo, max_steps=10
             )
             eval_result2 = evaluator.evaluate(msg, retry_reply)
             score2       = eval_result2.get("score", 10)
@@ -1025,7 +1125,7 @@ def main():
         try:
             resp = smart_client.chat_completions_create(
                 step=eval_attempt,
-                model=model["name"],
+                model=smart_client.active_model,
                 messages=messages,
                 temperature=temp,
                 max_tokens=4096,
