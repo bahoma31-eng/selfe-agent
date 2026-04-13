@@ -21,7 +21,17 @@
       "tokens": 1612,
       "temperature": 0.2,
       "success": true
+    },
+    {
+      "turn": 3,
+      "timestamp": "2026-04-13T19:21:54Z",
+      "user": "يبدو ان المهمة قد فشلت؟",
+      "agent": "أعتذر بشدة عن ذلك! نعم، لقد فشلت المهمة السابقة.\n\nالرسالة التي ظهرت \"Error code: 503 - This model is currently experiencing high demand...\" تعني أن هناك ضغطاً كبيراً على الخادم الذي أعمل عليه حالياً، مما منعني من إكمال طلبك في ذلك الوقت. هذا عادةً ما يكون مؤقتاً.\n\nهل ترغب في أن نحاول مرة أخرى الآن؟ أو هل لديك طلب آخر؟",
+      "model": "gemini-2.5-flash",
+      "tokens": 1349,
+      "temperature": 0.7,
+      "success": true
     }
   ],
-  "updated_at": "2026-04-13T19:10:45Z"
+  "updated_at": "2026-04-13T19:21:54Z"
 }
