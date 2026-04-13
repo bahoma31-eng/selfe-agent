@@ -22,7 +22,7 @@ MEMORY_DIR         = "memory"
 
 EVAL_THRESHOLD        = 6
 MAX_SELF_EVAL_RETRIES = 2
-EV AL_LOG_PATH         = f"{MEMORY_DIR}/eval_log.jsonl"
+EVAL_LOG_PATH         = f"{MEMORY_DIR}/eval_log.jsonl"
 PROMPT_STATS_PATH     = f"{MEMORY_DIR}/prompt_stats.json"
 ERROR_LOG_PATH        = f"{MEMORY_DIR}/error_log.jsonl"
 
@@ -205,7 +205,7 @@ class ToolRegistry:
     def get_tool(self, name: str) -> Optional[Any]:
         return self._tools.get(name)
 
-    def list_tool_names(self) -> List[str]:\
+    def list_tool_names(self) -> List[str]:
         return list(self._tools.keys())
 
     def __contains__(self, name: str) -> bool:
