@@ -1,6 +1,6 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v5.4.2 (نسخة GitHub Actions)
-# جديد v5.4.2: عداد فشل الأدوات — منع تكرار أداة فاشلة أكثر من مرتين
+# agent_ci.py — Selfe Agent v6.0.0
+# إصلاح شامل: فصل طبقات الفشل + Retry ذكي + ReAct محسّن
 # =============================================================
 
 import os
@@ -16,7 +16,6 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 MODELS_FILE        = "models.txt"
 SYSTEM_PROMPT_FILE = "system_prompt.txt"
-MAX_RETRIES        = 3
 MAX_MEMORY_TURNS   = 5
 MEMORY_DIR         = "memory"
 
@@ -41,7 +40,29 @@ PROVIDER_CONFIG = {
 }
 
 # ===================================================================
-# ErrorMonitor — نظام تتبّع الأخطاء المنظّم (v5.4.0)
+# استراتيجية Retry المخصصة لكل كود HTTP
+# ===================================================================
+
+RETRY_STRATEGY: Dict[Any, dict] = {
+    429: {"max_attempts": 5, "base_delay": 30.0, "backoff": "linear",      "rotate_key": True},
+    503: {"max_attempts": 4, "base_delay": 5.0,  "backoff": "exponential", "rotate_key": False},
+    500: {"max_attempts": 3, "base_delay": 2.0,  "backoff": "exponential", "rotate_key": False},
+    "default": {"max_attempts": 3, "base_delay": 1.0, "backoff": "fixed",  "rotate_key": False},
+}
+
+
+def _compute_delay(strategy: dict, attempt: int) -> float:
+    base = strategy["base_delay"]
+    mode = strategy["backoff"]
+    if mode == "exponential":
+        return base * (2 ** attempt)
+    if mode == "linear":
+        return base * (attempt + 1)
+    return base  # fixed
+
+
+# ===================================================================
+# ErrorMonitor
 # ===================================================================
 
 SEVERITY_INFO     = "INFO"
@@ -75,31 +96,22 @@ class ErrorMonitor:
         severity = ERROR_SEVERITY_MAP.get(code, SEVERITY_ERROR)
         return code, severity
 
-    def _should_rotate_key(self, error_code: int) -> bool:
-        return error_code == 429
-
-    def _should_retry_later(self, error_code: int) -> bool:
-        return error_code in (429, 503)
-
-    def _retry_delay(self, error_code: int, attempt: int) -> float:
-        if error_code == 429:
-            return 20.0
-        return 2 ** attempt
-
     def log(self, error: Exception, context: str = "", step: int = 0) -> dict:
-        error_str  = str(error)
+        error_str      = str(error)
         code, severity = self._classify(error_str)
+        strategy       = RETRY_STRATEGY.get(code, RETRY_STRATEGY["default"])
         entry = {
-            "ts":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "severity":     severity,
-            "error_code":   code,
-            "model":        self.model_name,
-            "issue":        self.issue_number,
-            "step":         step,
-            "context":      context,
-            "message":      error_str[:500],
-            "rotate_key":   self._should_rotate_key(code),
-            "retry_later":  self._should_retry_later(code),
+            "ts":          datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "severity":    severity,
+            "error_code":  code,
+            "model":       self.model_name,
+            "issue":       self.issue_number,
+            "step":        step,
+            "context":     context,
+            "message":     error_str[:500],
+            "rotate_key":  strategy["rotate_key"],
+            "retry_later": code in (429, 503),
+            "max_attempts": strategy["max_attempts"],
         }
         icon = {"INFO": "ℹ", "WARNING": "⚠", "ERROR": "✖", "CRITICAL": "🔴"}.get(severity, "?")
         print(f"[ErrorMonitor] {icon} [{severity}] code={code} ctx={context} → {error_str[:120]}")
@@ -124,10 +136,15 @@ class ErrorMonitor:
 
 
 # ===================================================================
-# SmartAPIClient
+# SmartAPIClient — طبقة الشبكة فقط (لا تعرف منطق المهام)
 # ===================================================================
 
 class SmartAPIClient:
+    """
+    يتولى حصراً: إعادة المحاولة عند أخطاء الشبكة/API.
+    لا يعرف شيئاً عن منطق ReAct أو الأدوات.
+    """
+
     def __init__(self, keys: List[str], base_url: str, model_name: str, monitor: ErrorMonitor):
         from openai import OpenAI
         self._OpenAI    = OpenAI
@@ -142,7 +159,7 @@ class SmartAPIClient:
         from openai import OpenAI
         return OpenAI(api_key=self.keys[self._key_idx], base_url=self.base_url)
 
-    def _rotate_key(self):
+    def _rotate_key(self) -> bool:
         if len(self.keys) <= 1:
             print("[SmartAPIClient] ⚠ مفتاح واحد فقط، لا يوجد مفتاح بديل.")
             return False
@@ -152,26 +169,41 @@ class SmartAPIClient:
         return True
 
     def chat_completions_create(self, step: int = 0, **kwargs) -> Any:
+        """
+        يحاول الاتصال بـ API مع إعادة المحاولة الذكية حسب كود الخطأ.
+        يعيد النتيجة فقط عند النجاح، أو يرفع الاستثناء بعد استنزاف كل المحاولات.
+        react_loop لا يرى أخطاء الشبكة — هذا الكلاس يحلها داخلياً.
+        """
         last_error = None
-        for attempt in range(MAX_RETRIES):
+        attempt    = 0
+
+        while True:
             try:
                 return self._client.chat.completions.create(**kwargs)
             except Exception as e:
-                entry = self.monitor.log(e, context="chat_completions_create", step=step)
+                entry    = self.monitor.log(e, context="chat_completions_create", step=step)
                 last_error = e
-                if entry["error_code"] == 429:
-                    self._rotate_key()
-                    delay = entry.get("retry_delay", 20.0)
-                    print(f"[SmartAPIClient] ⏳ انتظار {delay}s بعد 429...")
-                    time.sleep(delay)
-                elif entry["error_code"] == 503:
-                    delay = 2 ** (attempt + 1)
-                    print(f"[SmartAPIClient] ⏳ انتظار {delay}s بعد 503...")
-                    time.sleep(delay)
-                elif entry["severity"] == SEVERITY_CRITICAL:
+                code     = entry["error_code"]
+                severity = entry["severity"]
+
+                # خطأ حرج → لا تعيد المحاولة
+                if severity == SEVERITY_CRITICAL:
                     raise
-                elif attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
+
+                strategy     = RETRY_STRATEGY.get(code, RETRY_STRATEGY["default"])
+                max_attempts = strategy["max_attempts"]
+
+                if attempt >= max_attempts - 1:
+                    break
+
+                if strategy["rotate_key"]:
+                    self._rotate_key()
+
+                delay = _compute_delay(strategy, attempt)
+                print(f"[SmartAPIClient] ⏳ محاولة {attempt+1}/{max_attempts} — انتظار {delay:.1f}s (code={code})")
+                time.sleep(delay)
+                attempt += 1
+
         raise last_error
 
     @property
@@ -229,7 +261,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/5.4.2",
+        "User-Agent": "selfe-agent/6.0.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -269,77 +301,116 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v5.4.2
-# إصلاح v5.4.1: عند غياب الأداة (action is None) — لا ينتهي اللوب بل يطلب من النموذج المتابعة
-# جديد v5.4.2: عداد فشل الأدوات — إذا فشلت أداة مرتين يُعلَم النموذج ويُطلب منه بديل
+# ReAct Loop — v6.0.0
+# إصلاحات شاملة:
+#   - فصل واضح: SmartAPIClient يعالج أخطاء الشبكة، react_loop يعالج منطق الأدوات
+#   - max_steps افتراضي = 10 (كان 6)
+#   - REACT_SYSTEM_PROMPT أكثر صرامة ووضوحاً
+#   - parse_tool_call يدعم JSON بدون code fence
+#   - أداة search_files جديدة
+#   - عداد فشل الأدوات مُحسَّن (حد = 3 بدل 2)
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
-أنت Selfe، وكيل ذكاء اصطناعي متقدّم.
-لديك صلاحية استخدام الأدوات التالية:
+أنت Selfe، وكيل ذكاء اصطناعي متقدّم يعمل بنمط ReAct (Reason + Act).
 
-1. push_file   — رفع ملف إلى GitHub
-2. read_file   — قراءة ملف من GitHub
-3. list_files  — عرض قائمة الملفات في مجلد
-4. answer      — إرجاع الرد النهائي للمستخدم
+## الأدوات المتاحة
 
-فورمات استخدام الأدوات (اكتب واحدةً فقط في كل رد):
+| الأداة       | الوصف                                 |
+|-------------|---------------------------------------|
+| read_file   | قراءة محتوى ملف من GitHub             |
+| push_file   | رفع/تعديل ملف في GitHub               |
+| list_files  | عرض الملفات والمجلدات                 |
+| search_files| البحث عن ملف بالاسم في المستودع       |
+| answer      | إرجاع الرد النهائي للمستخدم           |
 
-للقراءة:
+## صيغة الاستخدام (إلزامية)
+
+كل رد يجب أن يحتوي على أداة واحدة فقط بهذا الشكل الدقيق:
+
 ```json
-{"tool": "read_file", "path": "<مسار الملف>"}
-```
-لعرض الملفات:
-```json
-{"tool": "list_files", "path": "<المجلد>"}
-```
-للرفع:
-```json
-{"tool": "push_file", "path": "<مسار>", "content": "<المحتوى>", "message": "<رسالة commit>"}
-```
-للإجابة النهائية:
-```json
-{"tool": "answer", "text": "<ردك النهائي هنا>"}
+{"tool": "read_file", "path": "agent_ci.py"}
 ```
 
-قواعد مهمة:
-- اكتب دائما JSON داخل ```json ... ``` فقط
-- لا تكتب أداتين في نفس الرد
-- إذا لم تحتج أدوات، استخدم answer مباشرة
-- لا تضع أي نص قبل JSON أو بعده في نفس الرد
+```json
+{"tool": "list_files", "path": "memory"}
+```
+
+```json
+{"tool": "push_file", "path": "output.py", "content": "# code", "message": "feat: add output"}
+```
+
+```json
+{"tool": "search_files", "query": "agent"}
+```
+
+```json
+{"tool": "answer", "text": "ردك النهائي هنا"}
+```
+
+## قواعد صارمة — لا استثناء
+
+1. **أداة واحدة فقط** في كل رد. لا أداتين معاً أبداً.
+2. **JSON داخل ```json ... ```** دائماً — لا تكتب JSON خارج code fence.
+3. **لا تتوقف قبل الإجابة النهائية** — استخدم tool=answer فقط عندما تنتهي من جميع خطوات المهمة.
+4. **إذا فشلت أداة** — انتقل لأداة بديلة أو غيّر المسار، ولا تكرر نفس الخطأ.
+5. **لا تكتب أي نص** قبل JSON أو بعده في نفس الرد.
+6. **استمر في العمل** حتى تُنجز المهمة كاملةً أو تستنفد جميع الأدوات.
 """
 
 REACT_KEYWORDS = [
     "ثم", "بعد ذلك", "حلّل", "اقرأ", "تحقّق",
     "خطوات", "عدة", "أولاً", "ثانياً", "ثالثاً",
-    "افحص", "عدل", "راجع",
+    "افحص", "عدل", "راجع", "قارن", "ابحث", "حدّث",
     "then", "after that", "analyze", "check", "read", "steps", "multiple",
+    "update", "modify", "compare", "search", "find",
 ]
 
 
 def is_complex_task(msg: str) -> bool:
     msg_lower = msg.lower()
     matched = sum(1 for kw in REACT_KEYWORDS if kw in msg_lower)
-    return matched >= 2 or (matched >= 1 and len(msg) > 300)
+    # عتبة مخفّضة: كلمة مفتاحية واحدة كافية لتفعيل ReAct
+    return matched >= 1 or len(msg) > 200
 
 
 def parse_tool_call(text: str) -> Optional[dict]:
+    """
+    يحلّل استدعاء الأداة من النص.
+    يدعم: JSON داخل ```json ... ``` وJSON مباشر بدون code fence.
+    """
+    # 1. JSON داخل code fence (الصيغة المفضلة)
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
+
+    # 2. JSON مباشر يحتوي على "tool"
     m = re.search(r"(\{[^{}]*\"tool\"[^{}]*\})", text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
+
+    # 3. JSON متعدد الأسطر
+    m = re.search(r"(\{[\s\S]*?\"tool\"[\s\S]*?\})", text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+
     return None
 
 
 def execute_tool(action: dict, owner: str, repo: str) -> str:
+    """
+    طبقة الأدوات — تعالج فشل الأدوات فقط (ملف غير موجود، GitHub API error).
+    لا تعرف شيئاً عن أخطاء الشبكة (تلك تعالجها SmartAPIClient).
+    """
     tool = action.get("tool", "")
 
     if tool == "push_file":
@@ -358,7 +429,7 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
             return "❌ يجب تحديد path."
         content = read_file_from_github(owner, repo, path)
         if content is None:
-            return f"❌ لم يُعثر على `{path}`."
+            return f"❌ لم يُعثر على `{path}`. تحقق من المسار أو استخدم list_files."
         if len(content) > 8000:
             content = content[:8000] + "\n...[truncated]"
         return f"📄 محتوى `{path}`:\n```\n{content}\n```"
@@ -380,11 +451,30 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         except Exception as e:
             return f"❌ خطأ list_files: {e}"
 
+    elif tool == "search_files":
+        query = action.get("query", "")
+        if not query:
+            return "❌ يجب تحديد query للبحث."
+        try:
+            # بحث بسيط في جذر المستودع
+            items = _github_request("GET", f"/repos/{owner}/{repo}/git/trees/main?recursive=1")
+            tree  = items.get("tree", [])
+            matches = [
+                f"{'📁' if i.get('type') == 'tree' else '📄'} {i['path']}"
+                for i in tree
+                if query.lower() in i.get("path", "").lower()
+            ]
+            if not matches:
+                return f"🔍 لا نتائج لـ `{query}`."
+            return f"🔍 نتائج البحث عن `{query}`:\n" + "\n".join(matches[:30])
+        except Exception as e:
+            return f"❌ خطأ search_files: {e}"
+
     elif tool == "answer":
         return action.get("text", "")
 
     else:
-        return f"⚠️ أداة غير معروفة: `{tool}`"
+        return f"⚠️ أداة غير معروفة: `{tool}`. الأدوات المتاحة: read_file, push_file, list_files, search_files, answer"
 
 
 def react_loop(
@@ -393,22 +483,22 @@ def react_loop(
     messages: list,
     owner: str,
     repo: str,
-    max_steps: int = 6,
+    max_steps: int = 10,
 ) -> tuple:
     """
-    دورة ReAct مع SmartAPIClient:
-      Thought → Action (JSON) → Observation → ... → answer
+    دورة ReAct: Thought → Action (JSON) → Observation → ... → answer
     ترجع (final_reply: str, total_tokens: int)
 
-    v5.4.1: عند غياب الأداة (action is None)، لا ينتهي اللوب بل يطلب
-    من النموذج توضيح ما إذا انتهى أم يجب المتابعة.
-
-    v5.4.2: عداد فشل الأدوات — إذا فشلت نفس الأداة مرتين متتاليتين،
-    يُعلَم النموذج ويُطلب منه اتخاذ مسار بديل أو استخدام tool=answer.
+    v6.0.0 — إصلاحات شاملة:
+    - SmartAPIClient يعالج أخطاء الشبكة داخلياً → react_loop لا يراها
+    - عند غياب الأداة: يطلب من النموذج المتابعة (لا يتوقف)
+    - عداد فشل الأدوات: حد = 3 محاولات قبل طلب مسار بديل
+    - max_steps = 10 افتراضياً (كان 6)
+    - رسائل التوجيه أوضح وأكثر تفصيلاً
     """
     total_tokens  = 0
-    log_steps     = []
-    tool_fail_count: Dict[str, int] = {}  # v5.4.2: عداد فشل لكل أداة
+    tool_fail_count: Dict[str, int] = {}
+    no_tool_count = 0  # عداد ردود بدون أداة
 
     for step in range(1, max_steps + 1):
         print(f"[ReAct] خطوة {step}/{max_steps}")
@@ -425,62 +515,84 @@ def react_loop(
             tokens = getattr(resp.usage, "total_tokens", 0)
             total_tokens += tokens
         except Exception as e:
-            return f"⚠️ خطأ ReAct API (خطوة {step}): {e}", total_tokens
+            # هذا يحدث فقط إذا استنفدت SmartAPIClient كل محاولاتها
+            return f"⚠️ خطأ API لا يمكن التعافي منه (خطوة {step}): {e}", total_tokens
 
         print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
 
         action = parse_tool_call(raw)
 
-        # ============================================================
-        # إصلاح v5.4.1: بدل من إنهاء الحلقة، نطلب من النموذج المتابعة
-        # ============================================================
+        # ── لا توجد أداة في الرد ──────────────────────────────
         if action is None:
-            print(f"[ReAct] لم تُعثر على أداة في الخطوة {step}، طلب التوضيح.")
+            no_tool_count += 1
+            print(f"[ReAct] لم تُعثر على أداة (المرة {no_tool_count}).")
+
+            if no_tool_count >= 3:
+                # ثلاث ردود بدون أداة → اعتبر الرد نهائياً
+                print("[ReAct] ثلاثة ردود بدون أداة → اعتبار الرد نهائياً.")
+                return raw, total_tokens
+
             messages.append({"role": "assistant", "content": raw})
             messages.append({
                 "role": "user",
-                "content": "لم أتلقَّ أداة. هل انتهيت من المهمة؟ إذا نعم استخدم tool=answer، وإلا تابع مع الأداة التالية."
+                "content": (
+                    "⚠️ لم أتلقَّ أداة بالصيغة المطلوبة. تذكّر:\n"
+                    "- يجب أن يحتوي ردك على أداة واحدة داخل ```json ... ```\n"
+                    "- إذا انتهيت من المهمة: استخدم ```json\n{\"tool\": \"answer\", \"text\": \"ردك\"}\n```\n"
+                    "- إذا لم تنتهِ: تابع مع الأداة التالية المناسبة."
+                )
             })
-            continue  # تابع الحلقة بدل من إنهائها
+            continue
 
+        # إعادة تعيين عداد ردود بدون أداة
+        no_tool_count = 0
         tool_name = action.get("tool", "")
-        log_steps.append(f"**Step {step}:** tool=`{tool_name}`")
 
+        # ── أداة answer = نهاية اللوب ────────────────────────
         if tool_name == "answer":
             final = action.get("text", raw)
+            print(f"[ReAct] ✅ اكتمال في الخطوة {step}.")
             return final, total_tokens
 
+        # ── تنفيذ الأداة ──────────────────────────────────────
         observation = execute_tool(action, owner, repo)
         print(f"[ReAct] Observation: {observation[:200]}")
 
-        # ============================================================
-        # جديد v5.4.2: عداد فشل الأدوات
-        # إذا فشلت الأداة (observation تبدأ بـ ❌)، نزيد العداد
-        # عند تجاوز الحد (مرتان)، نُعلم النموذج ونطلب مساراً بديلاً
-        # ============================================================
+        # ── عداد فشل الأدوات ──────────────────────────────────
         if observation.startswith("❌"):
             tool_fail_count[tool_name] = tool_fail_count.get(tool_name, 0) + 1
             fail_count = tool_fail_count[tool_name]
-            print(f"[ReAct] ⚠ أداة `{tool_name}` فشلت {fail_count} مرة/مرات.")
+            print(f"[ReAct] ⚠ أداة `{tool_name}` فشلت {fail_count}/3.")
 
-            if fail_count >= 2:
-                print(f"[ReAct] 🚫 `{tool_name}` فشلت مرتين — إعلام النموذج بالتخلي عنها.")
+            if fail_count >= 3:
+                print(f"[ReAct] 🚫 `{tool_name}` فشلت 3 مرات — طلب مسار بديل.")
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({
                     "role": "user",
                     "content": (
                         f"Observation: {observation}\n\n"
-                        f"⚠️ فشلت أداة `{tool_name}` {fail_count} مرات متتالية بسبب خطأ في الخدمة. "
-                        f"لا تُعيد استخدامها. انتقل إلى مسار بديل أو استخدم tool=answer مع شرح ما تعذّر إنجازه."
+                        f"🚫 فشلت أداة `{tool_name}` {fail_count} مرات متتالية. "
+                        f"لا تُعيد استخدامها. "
+                        f"انتقل إلى مسار بديل (مثلاً: list_files للتحقق من المسار، "
+                        f"أو search_files للعثور على الملف)، "
+                        f"أو استخدم tool=answer مع شرح ما تعذّر إنجازه."
                     )
                 })
                 continue
 
-        messages.append({"role": "assistant",  "content": raw})
-        messages.append({"role": "user",       "content": f"Observation: {observation}"})
+        messages.append({"role": "assistant", "content": raw})
+        messages.append({"role": "user", "content": f"Observation: {observation}"})
 
-    # بلغنا max_steps — نطلب رداً نهائياً
-    messages.append({"role": "user", "content": "لقد انتهت جميع الخطوات. أجب بشكل نهائي باستخدام tool=answer."})
+    # ── استنفاد max_steps — طلب رد نهائي ──────────────────────
+    print(f"[ReAct] ⚠ وصلنا للحد الأقصى ({max_steps} خطوات). طلب رد نهائي...")
+    messages.append({
+        "role": "user",
+        "content": (
+            f"انتهت جميع الخطوات ({max_steps}/{max_steps}). "
+            "لخّص ما أُنجز وما تعذّر إنجازه، ثم أجب نهائياً باستخدام:\n"
+            "```json\n{\"tool\": \"answer\", \"text\": \"ردك النهائي\"}\n```"
+        )
+    })
     try:
         resp = smart_client.chat_completions_create(
             step=max_steps + 1,
@@ -760,7 +872,7 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v5.4.2] تشغيل...")
+    print("\n[Selfe Agent CI v6.0.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
@@ -793,8 +905,7 @@ def main():
         write_output("⚠️ مكتبة openai غير مثبَّتة.")
         sys.exit(1)
 
-    cfg     = PROVIDER_CONFIG[model["provider"]]
-
+    cfg          = PROVIDER_CONFIG[model["provider"]]
     monitor      = ErrorMonitor(owner, repo, issue_number, model["name"])
     smart_client = SmartAPIClient(pkeys, cfg["base_url"], model["name"], monitor)
     evaluator    = SelfEvaluator(owner, repo, smart_client, model["name"])
@@ -803,8 +914,9 @@ def main():
     is_push, push_instruction = detect_push_command(msg)
     if is_push:
         print(f"[CI] /push — {push_instruction}")
-        filename = extract_filename(push_instruction)
-        for attempt in range(MAX_RETRIES):
+        filename   = extract_filename(push_instruction)
+        max_push_retries = RETRY_STRATEGY["default"]["max_attempts"]
+        for attempt in range(max_push_retries):
             try:
                 resp = smart_client.chat_completions_create(
                     step=0,
@@ -833,21 +945,21 @@ def main():
                 monitor.flush_to_github()
                 return
             except Exception as e:
-                if attempt >= MAX_RETRIES - 1:
+                if attempt >= max_push_retries - 1:
                     monitor.flush_to_github()
                     write_output(f"⚠️ خطأ /push: {e}")
                     sys.exit(1)
 
-    # ── ReAct Loop (مهام معقدة) + SelfEval + Memory ──────
+    # ── ReAct Loop (جميع المهام الآن — عتبة مخفّضة) ──────────────
     if is_complex_task(msg):
-        print(f"[CI] ✨ مهمة معقدة → تفعيل ReAct Loop")
+        print(f"[CI] ✨ تفعيل ReAct Loop")
         base_sp      = load_system_prompt(SYSTEM_PROMPT_FILE)
         data         = memory.load_issue_memory()
         current_turn = len(data.get("turns", [])) + 1
 
         messages = memory.build_messages(REACT_SYSTEM_PROMPT + "\n\n" + base_sp, msg)
         final_reply, total_tokens = react_loop(
-            smart_client, model["name"], messages, owner, repo, max_steps=6
+            smart_client, model["name"], messages, owner, repo, max_steps=10
         )
 
         eval_result = evaluator.evaluate(msg, final_reply)
@@ -855,13 +967,13 @@ def main():
         print(f"[SelfEval/ReAct] {score}/10")
 
         if score < EVAL_THRESHOLD:
-            print(f"[SelfEval/ReAct] ⚠ score={score} < {EVAL_THRESHOLD} → إعادة محاولة بـ refined prompt")
+            print(f"[SelfEval/ReAct] ⚠ score={score} < {EVAL_THRESHOLD} → إعادة محاولة")
             refined_sp = evaluator.refine_system_prompt(
                 REACT_SYSTEM_PROMPT + "\n\n" + base_sp, eval_result
             )
             messages2 = memory.build_messages(refined_sp, msg)
             retry_reply, retry_tokens = react_loop(
-                smart_client, model["name"], messages2, owner, repo, max_steps=6
+                smart_client, model["name"], messages2, owner, repo, max_steps=10
             )
             eval_result2 = evaluator.evaluate(msg, retry_reply)
             score2       = eval_result2.get("score", 10)
@@ -890,7 +1002,7 @@ def main():
         print(f"[CI] ReAct اكتمل ✔  (score={score})")
         return
 
-    # ── وضع عادي (Single-shot) + SelfEval + Memory ────
+    # ── وضع عادي (Single-shot) + SelfEval + Memory ────────────────
     base_system_prompt    = load_system_prompt(SYSTEM_PROMPT_FILE)
     temp                  = detect_temperature(msg)
     current_system_prompt = base_system_prompt
