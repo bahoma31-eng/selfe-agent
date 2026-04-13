@@ -8,6 +8,7 @@ on:
 
 jobs:
   run-selfe:
+    # تجنّب الحلقة اللانهائية: تجاهل تعليقات الروبوت نفسه
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
@@ -32,6 +33,17 @@ jobs:
       - name: Install dependencies
         run: pip install openai>=1.0.0
 
+      # ── استخراج رقم الـ Issue ──────────────────────────────────
+      - name: Extract Issue Number
+        id: issue_info
+        run: |
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── استخراج نص الرسالة ────────────────────────────────────
       - name: Extract message from Issue or Comment
         id: extract
         run: |
@@ -49,6 +61,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # ── تشغيل الوكيل ─────────────────────────────────────────
       - name: Run Selfe Agent
         id: selfe
         env:
@@ -61,14 +74,15 @@ jobs:
           MODEL_INDEX:        "1"
           GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY:  ${{ github.repository }}
-          ISSUE_NUMBER:       ${{ github.event.issue.number || github.event.comment.issue_url }}
+          ISSUE_NUMBER:       ${{ steps.issue_info.outputs.number }}
         run: python agent_ci.py
 
+      # ── نشر الرد كـ comment ───────────────────────────────────
       - name: Post Selfe reply as comment
         uses: actions/github-script@v7
         with:
           script: |
-            const reply = process.env.SELFE_REPLY || "The agent could not generate a response.";
+            const reply = process.env.SELFE_REPLY || "⚠️ لم يتمكن الوكيل من توليد رد.";
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo:  context.repo.repo,
