@@ -1,11 +1,13 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v6.1.1
+# agent_ci.py — Selfe Agent v6.2.0
 # إصلاح شامل: فصل طبقات الفشل + Retry ذكي + ReAct محسّن
 # v6.1.1: إصلاح TypeError عند raw=None (choices[0].message.content)
 # v6.1.0: 3 حلول لاستنزاف حصة API:
 #   1. كشف quota_exceeded وتخطي المفتاح كلياً
 #   2. تدوير تلقائي بين مزودين (Gemini → Groq) عند 429/quota
 #   3. وضع Fallback: Groq كامل عند فشل Gemini بالكامل
+# v6.2.0: تحسين REACT_SYSTEM_PROMPT بقاعدة "لا تصف — افعل"
+#         + تحسين رسالة الخطأ في react_loop عند غياب الأداة
 # =============================================================
 
 import os
@@ -83,10 +85,6 @@ def _compute_delay(strategy: dict, attempt: int) -> float:
 
 
 def _is_quota_exhausted(error_str: str) -> bool:
-    """
-    الحل #1: كشف استنزاف الحصة الكاملة.
-    يميّز بين rate limit مؤقت (429 عادي) وحصة منتهية فعلاً.
-    """
     low = error_str.lower()
     return any(p in low for p in QUOTA_EXHAUSTED_PATTERNS)
 
@@ -111,8 +109,6 @@ ERROR_SEVERITY_MAP = {
 
 
 class ErrorMonitor:
-    """نظام تتبّع وتسجيل الأخطاء بصيغة منظّمة."""
-
     def __init__(self, owner: str, repo: str, issue_number: str, model_name: str):
         self.owner        = owner
         self.repo         = repo
@@ -169,21 +165,10 @@ class ErrorMonitor:
 
 
 # ===================================================================
-# SmartAPIClient — v6.1.1
-# الحل #1: كشف quota_exhausted → تخطي المفتاح فوراً
-# الحل #2: تدوير تلقائي بين مزودين عند استنزاف كل مفاتيح مزود
-# الحل #3: Fallback كامل إلى Groq عند فشل المزود الأساسي
+# SmartAPIClient — v6.2.0
 # ===================================================================
 
 class SmartAPIClient:
-    """
-    يتولى حصراً: إعادة المحاولة عند أخطاء الشبكة/API.
-    v6.1.1:
-      - كشف quota_exhausted → تخطي المفتاح فوراً (لا تنتظر)
-      - تدوير بين مزودين عند استنزاف كل مفاتيح المزود الحالي
-      - Fallback إلى Groq عند فشل Gemini بالكامل
-    """
-
     def __init__(
         self,
         keys: List[str],
@@ -202,13 +187,10 @@ class SmartAPIClient:
         self.monitor          = monitor
         self._key_idx         = 0
         self._exhausted_keys: set = set()
-
-        # الحل #3 — Groq Fallback
         self.fallback_keys      = fallback_keys or []
         self.fallback_base_url  = fallback_base_url
         self.fallback_model     = fallback_model or GROQ_FALLBACK_MODEL
         self._using_fallback    = False
-
         self._client = self._make_client()
 
     def _make_client(self):
@@ -221,12 +203,10 @@ class SmartAPIClient:
         return self._OpenAI(api_key=self.keys[self._key_idx], base_url=self.base_url)
 
     def _rotate_key(self) -> bool:
-        """تدوير المفاتيح مع تخطي المفاتيح المستنزفة."""
         available = [i for i in range(len(self.keys)) if i not in self._exhausted_keys]
         if not available:
             print("[SmartAPIClient] 🔴 جميع المفاتيح مستنزفة.")
             return False
-        # اختر المفتاح التالي المتاح
         next_keys = [i for i in available if i != self._key_idx]
         if not next_keys:
             return False
@@ -236,9 +216,6 @@ class SmartAPIClient:
         return True
 
     def _activate_fallback(self) -> bool:
-        """
-        الحل #2 + #3: تفعيل Groq كـ Fallback عند استنزاف كل مفاتيح Gemini.
-        """
         if not self.fallback_keys or not self.fallback_base_url:
             print("[SmartAPIClient] ⚠ لا يوجد مزود fallback مُعرَّف.")
             return False
@@ -254,20 +231,11 @@ class SmartAPIClient:
 
     @property
     def active_model(self) -> str:
-        """اسم النموذج الفعلي المستخدم حالياً (قد يكون fallback)."""
         return self.fallback_model if self._using_fallback else self.model_name
 
     def chat_completions_create(self, step: int = 0, **kwargs) -> Any:
-        """
-        يحاول الاتصال بـ API مع إعادة المحاولة الذكية.
-        v6.1.1:
-          - quota_exhausted → تخطي المفتاح فوراً بدون انتظار
-          - استنزاف كل المفاتيح → تفعيل Groq Fallback تلقائياً
-        """
         last_error = None
         attempt    = 0
-
-        # ضمان استخدام النموذج الصحيح (fallback أو أصلي)
         kwargs["model"] = self.active_model
 
         while True:
@@ -280,17 +248,14 @@ class SmartAPIClient:
                 severity   = entry["severity"]
                 quota_ex   = entry.get("quota_exhausted", False)
 
-                # خطأ حرج → لا تعيد المحاولة
                 if severity == SEVERITY_CRITICAL:
                     raise
 
-                # الحل #1: quota_exhausted → تخطي المفتاح الحالي فوراً
                 if quota_ex and not self._using_fallback:
                     print(f"[SmartAPIClient] 🚫 مفتاح #{self._key_idx + 1} مستنزف كلياً — تخطٍّ فوري.")
                     self._exhausted_keys.add(self._key_idx)
                     rotated = self._rotate_key()
                     if not rotated:
-                        # الحل #2 + #3: كل المفاتيح مستنزفة → Groq Fallback
                         activated = self._activate_fallback()
                         if activated:
                             kwargs["model"] = self.active_model
@@ -305,7 +270,6 @@ class SmartAPIClient:
                 max_attempts = strategy["max_attempts"]
 
                 if attempt >= max_attempts - 1:
-                    # استنفاد محاولات هذا المزود → جرّب Fallback
                     if not self._using_fallback:
                         activated = self._activate_fallback()
                         if activated:
@@ -380,7 +344,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/6.1.1",
+        "User-Agent": "selfe-agent/6.2.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -420,7 +384,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v6.1.1
+# ReAct Loop — v6.2.0
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -468,6 +432,14 @@ REACT_SYSTEM_PROMPT = """\
 4. **إذا فشلت أداة** — انتقل لأداة بديلة أو غيّر المسار، ولا تكرر نفس الخطأ.
 5. **لا تكتب أي نص** قبل JSON أو بعده في نفس الرد.
 6. **استمر في العمل** حتى تُنجز المهمة كاملةً أو تستنفد جميع الأدوات.
+
+## ⛔ القاعدة الذهبية: لا تصف ما ستفعله — افعله مباشرةً
+
+الخطأ الشائع (محظور تماماً):
+  "سأقوم أولاً بـ X ثم Y، هل توافق؟"
+  "سأنفذ الخطوات التالية: 1. ... 2. ..."
+
+الصحيح: ابدأ فوراً بأداة JSON دون مقدمات.
 """
 
 REACT_KEYWORDS = [
@@ -589,7 +561,6 @@ def react_loop(
     no_tool_count = 0
 
     for step in range(1, max_steps + 1):
-        # استخدام النموذج الفعلي (قد تحوّل لـ Fallback)
         active_model = smart_client.active_model
         print(f"[ReAct] خطوة {step}/{max_steps}")
 
@@ -601,19 +572,14 @@ def react_loop(
                 temperature=0.2,
                 max_tokens=4096,
             )
-            # ── الإصلاح الأساسي v6.1.1 ──────────────────────────────
-            # choices[0].message.content قد يكون None عند بعض النماذج
             raw = (resp.choices[0].message.content or "").strip()
-            # ─────────────────────────────────────────────────────────
             tokens = getattr(resp.usage, "total_tokens", 0)
             total_tokens += tokens
         except Exception as e:
             return f"⚠️ خطأ API لا يمكن التعافي منه (خطوة {step}): {e}", total_tokens
 
-        # عرض أول 300 حرف من الرد بأمان
         print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
 
-        # إذا كان الرد فارغاً تماماً — عامله كرد بدون أداة
         if not raw:
             no_tool_count += 1
             print(f"[ReAct] رد فارغ (المرة {no_tool_count}).")
@@ -642,9 +608,13 @@ def react_loop(
             messages.append({
                 "role": "user",
                 "content": (
-                    "⚠️ لم أتلقَّ أداة بالصيغة المطلوبة. تذكّر:\n"
+                    "⛔ **خطأ: لم أتلقَّ أداة بالصيغة المطلوبة.**\n\n"
+                    "**القاعدة الذهبية:** لا تصف ما ستفعله — افعله مباشرةً.\n"
+                    "❌ خاطئ: \"سأقوم أولاً بقراءة الملف ثم...\"\n"
+                    "✅ صحيح: ابدأ فوراً بـ JSON:\n"
+                    "```json\n{\"tool\": \"read_file\", \"path\": \"agent_ci.py\"}\n```\n\n"
                     "- يجب أن يحتوي ردك على أداة واحدة داخل ```json ... ```\n"
-                    "- إذا انتهيت من المهمة: استخدم ```json\n{\"tool\": \"answer\", \"text\": \"ردك\"}\n```\n"
+                    "- إذا انتهيت من المهمة: ```json\n{\"tool\": \"answer\", \"text\": \"ردك\"}\n```\n"
                     "- إذا لم تنتهِ: تابع مع الأداة التالية المناسبة."
                 )
             })
@@ -702,7 +672,6 @@ def react_loop(
             temperature=0.3,
             max_tokens=2048,
         )
-        # تطبيق نفس الإصلاح في الرد النهائي
         raw    = (resp.choices[0].message.content or "").strip()
         total_tokens += getattr(resp.usage, "total_tokens", 0)
         action = parse_tool_call(raw)
@@ -970,12 +939,11 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 
 
 # ===================================================================
-# main — v6.1.1
-# بناء SmartAPIClient مع Groq Fallback
+# main — v6.2.0
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v6.1.1] تشغيل...")
+    print("\n[Selfe Agent CI v6.2.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
@@ -1000,7 +968,6 @@ def main():
         write_output(f"⚠️ لا يوجد مفتاح API لـ: {model['provider']}")
         sys.exit(1)
 
-    # ── الحل #3: تجهيز Groq Fallback إذا كان المزود الأصلي Gemini ──
     groq_keys     = all_keys.get("groq", [])
     groq_base_url = PROVIDER_CONFIG["groq"]["base_url"]
     fallback_keys      = groq_keys if model["provider"] == "gemini" and groq_keys else []
