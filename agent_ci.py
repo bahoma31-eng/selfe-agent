@@ -1,8 +1,10 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v5.3.0 (نسخة GitHub Actions)
-# جديد v5.3.0: دمج SelfEval + Memory مع ReAct Loop كاملاً
-#   - المهام البسيطة  → Single-shot → SelfEval → Memory  (كما كان)
-#   - المهام المعقدة → ReAct Loop → SelfEval → Memory   (جديد)
+# agent_ci.py — Selfe Agent v5.4.0 (نسخة GitHub Actions)
+# جديد v5.4.0: نظام مراقبة أخطاء منظّم (error-trace)
+#   - Structured error logging بمستويات خطورة واضحة
+#   - تدوير مفاتيح API تلقائياً عند خطأ 429
+#   - Fallback للنموذج البديل عند 503
+#   - تسجيل كل خطأ في memory/error_log.jsonl
 # =============================================================
 
 import os
@@ -26,6 +28,7 @@ EVAL_THRESHOLD        = 6
 MAX_SELF_EVAL_RETRIES = 2
 EVAL_LOG_PATH         = f"{MEMORY_DIR}/eval_log.jsonl"
 PROMPT_STATS_PATH     = f"{MEMORY_DIR}/prompt_stats.json"
+ERROR_LOG_PATH        = f"{MEMORY_DIR}/error_log.jsonl"
 
 PROVIDER_CONFIG = {
     "gemini": {
@@ -40,6 +43,180 @@ PROVIDER_CONFIG = {
         "secret_vars": ["GROQ_API_KEY"],
     },
 }
+
+# ===================================================================
+# ErrorMonitor — نظام تتبّع الأخطاء المنظّم (v5.4.0)
+# ===================================================================
+
+# مستويات الخطورة
+SEVERITY_INFO     = "INFO"
+SEVERITY_WARNING  = "WARNING"
+SEVERITY_ERROR    = "ERROR"
+SEVERITY_CRITICAL = "CRITICAL"
+
+# تصنيف رموز الأخطاء
+ERROR_SEVERITY_MAP = {
+    400: SEVERITY_ERROR,
+    401: SEVERITY_CRITICAL,   # مفتاح خاطئ — يحتاج تدخّلاً
+    403: SEVERITY_CRITICAL,
+    429: SEVERITY_WARNING,    # تجاوز الحصة — يُدار تلقائياً
+    500: SEVERITY_ERROR,
+    503: SEVERITY_WARNING,    # ازدحام مؤقت — يُعاد المحاولة
+}
+
+
+class ErrorMonitor:
+    """نظام تتبّع وتسجيل الأخطاء بصيغة منظّمة."""
+
+    def __init__(self, owner: str, repo: str, issue_number: str, model_name: str):
+        self.owner        = owner
+        self.repo         = repo
+        self.issue_number = issue_number
+        self.model_name   = model_name
+        self._buffer: List[dict] = []
+
+    def _classify(self, error_str: str) -> tuple:
+        """يستخرج رمز الخطأ ومستوى خطورته من نص الخطأ."""
+        code_match = re.search(r"Error code:\s*(\d+)", str(error_str))
+        code = int(code_match.group(1)) if code_match else 0
+        severity = ERROR_SEVERITY_MAP.get(code, SEVERITY_ERROR)
+        return code, severity
+
+    def _should_rotate_key(self, error_code: int) -> bool:
+        return error_code == 429
+
+    def _should_retry_later(self, error_code: int) -> bool:
+        return error_code in (429, 503)
+
+    def _retry_delay(self, error_code: int, attempt: int) -> float:
+        """يحسب وقت الانتظار المناسب بحسب نوع الخطأ."""
+        if error_code == 429:
+            # استخراج وقت الانتظار من رسالة الخطأ إن وُجد
+            return 20.0
+        return 2 ** attempt  # exponential backoff للأخطاء الأخرى
+
+    def log(self, error: Exception, context: str = "", step: int = 0) -> dict:
+        """يسجّل الخطأ بصيغة منظّمة ويُرجع بيانات التصنيف."""
+        error_str  = str(error)
+        code, severity = self._classify(error_str)
+
+        entry = {
+            "ts":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "severity":     severity,
+            "error_code":   code,
+            "model":        self.model_name,
+            "issue":        self.issue_number,
+            "step":         step,
+            "context":      context,
+            "message":      error_str[:500],
+            "rotate_key":   self._should_rotate_key(code),
+            "retry_later":  self._should_retry_later(code),
+        }
+
+        # طباعة منظّمة في الـ log
+        icon = {"INFO": "ℹ", "WARNING": "⚠", "ERROR": "✖", "CRITICAL": "🔴"}.get(severity, "?")
+        print(f"[ErrorMonitor] {icon} [{severity}] code={code} ctx={context} → {error_str[:120]}")
+
+        self._buffer.append(entry)
+        return entry
+
+    def flush_to_github(self):
+        """يرفع سجلات الأخطاء المتراكمة إلى GitHub."""
+        if not self._buffer:
+            return
+        try:
+            existing = read_file_from_github(self.owner, self.repo, ERROR_LOG_PATH) or ""
+            lines    = "\n".join(json.dumps(e, ensure_ascii=False) for e in self._buffer)
+            push_file_to_github(
+                self.owner, self.repo, ERROR_LOG_PATH,
+                existing.rstrip("\n") + "\n" + lines + "\n",
+                f"monitor(error-log): {len(self._buffer)} event(s)",
+            )
+        except Exception as e:
+            print(f"[ErrorMonitor] ⚠ flush failed: {e}")
+        finally:
+            self._buffer.clear()
+
+
+# ===================================================================
+# SmartAPIClient — عميل API ذكي مع تدوير مفاتيح وفالباك
+# ===================================================================
+
+class SmartAPIClient:
+    """
+    يُغلّف openai.OpenAI مع:
+      - تدوير مفاتيح API تلقائياً عند 429
+      - إعادة المحاولة مع Exponential Backoff
+      - تسجيل كل خطأ عبر ErrorMonitor
+    """
+
+    def __init__(self, keys: List[str], base_url: str, model_name: str, monitor: ErrorMonitor):
+        from openai import OpenAI
+        self._OpenAI    = OpenAI
+        self.keys       = keys
+        self.base_url   = base_url
+        self.model_name = model_name
+        self.monitor    = monitor
+        self._key_idx   = 0
+        self._client    = self._make_client()
+
+    def _make_client(self):
+        from openai import OpenAI
+        return OpenAI(api_key=self.keys[self._key_idx], base_url=self.base_url)
+
+    def _rotate_key(self):
+        """يُدوّر إلى المفتاح التالي."""
+        if len(self.keys) <= 1:
+            print("[SmartAPIClient] ⚠ مفتاح واحد فقط، لا يوجد مفتاح بديل.")
+            return False
+        self._key_idx = (self._key_idx + 1) % len(self.keys)
+        self._client  = self._make_client()
+        print(f"[SmartAPIClient] 🔄 تدوير المفتاح → مفتاح #{self._key_idx + 1}")
+        return True
+
+    def chat_completions_create(self, step: int = 0, **kwargs) -> Any:
+        """
+        يُرسل طلب API مع معالجة ذكية للأخطاء:
+          429 → تدوير المفتاح + انتظار 20s
+          503 → انتظار exponential backoff
+          غيرها → رفع الخطأ مباشرةً
+        """
+        last_error = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                return self._client.chat.completions.create(**kwargs)
+
+            except Exception as e:
+                entry = self.monitor.log(e, context="chat_completions_create", step=step)
+                last_error = e
+
+                if entry["error_code"] == 429:
+                    # تدوير المفتاح أولاً
+                    rotated = self._rotate_key()
+                    delay   = entry.get("retry_delay", 20.0)
+                    print(f"[SmartAPIClient] ⏳ انتظار {delay}s بعد 429...")
+                    time.sleep(delay)
+
+                elif entry["error_code"] == 503:
+                    delay = 2 ** (attempt + 1)
+                    print(f"[SmartAPIClient] ⏳ انتظار {delay}s بعد 503...")
+                    time.sleep(delay)
+
+                elif entry["severity"] == SEVERITY_CRITICAL:
+                    # لا فائدة من إعادة المحاولة
+                    raise
+
+                elif attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+
+        raise last_error
+
+    @property
+    def raw(self):
+        """يُرجع client الخام لاستخدامات خاصة."""
+        return self._client
+
 
 # ===================================================================
 # ToolRegistry
@@ -93,7 +270,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/5.3.0",
+        "User-Agent": "selfe-agent/5.4.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -133,7 +310,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v5.3.0
+# ReAct Loop — v5.4.0 (يستخدم SmartAPIClient)
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -253,7 +430,7 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
 
 
 def react_loop(
-    client,
+    smart_client: "SmartAPIClient",
     model_name: str,
     messages: list,
     owner: str,
@@ -261,7 +438,7 @@ def react_loop(
     max_steps: int = 6,
 ) -> tuple:
     """
-    دورة ReAct:
+    دورة ReAct مع SmartAPIClient:
       Thought → Action (JSON) → Observation → ... → answer
     ترجع (final_reply: str, total_tokens: int)
     """
@@ -272,7 +449,8 @@ def react_loop(
         print(f"[ReAct] خطوة {step}/{max_steps}")
 
         try:
-            resp   = client.chat.completions.create(
+            resp = smart_client.chat_completions_create(
+                step=step,
                 model=model_name,
                 messages=messages,
                 temperature=0.2,
@@ -282,7 +460,8 @@ def react_loop(
             tokens = getattr(resp.usage, "total_tokens", 0)
             total_tokens += tokens
         except Exception as e:
-            return f"⚠️ خطأ ReAct API: {e}", total_tokens
+            # الخطأ مسجَّل بالفعل في ErrorMonitor داخل SmartAPIClient
+            return f"⚠️ خطأ ReAct API (خطوة {step}): {e}", total_tokens
 
         print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
 
@@ -308,8 +487,12 @@ def react_loop(
     # بلغنا max_steps — نطلب رداً نهائياً
     messages.append({"role": "user", "content": "لقد انتهت جميع الخطوات. أجب بشكل نهائي باستخدام tool=answer."})
     try:
-        resp   = client.chat.completions.create(
-            model=model_name, messages=messages, temperature=0.3, max_tokens=2048,
+        resp = smart_client.chat_completions_create(
+            step=max_steps + 1,
+            model=model_name,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=2048,
         )
         raw    = resp.choices[0].message.content
         total_tokens += getattr(resp.usage, "total_tokens", 0)
@@ -411,15 +594,16 @@ EVAL_SYSTEM_PROMPT = """أنت مُقيّم موضوعي. قيّم الرد من
 
 
 class SelfEvaluator:
-    def __init__(self, owner, repo, client, model_name):
-        self.owner      = owner
-        self.repo       = repo
-        self.client     = client
-        self.model_name = model_name
+    def __init__(self, owner, repo, smart_client: "SmartAPIClient", model_name):
+        self.owner        = owner
+        self.repo         = repo
+        self.smart_client = smart_client
+        self.model_name   = model_name
 
     def evaluate(self, user_msg, agent_reply):
         try:
-            resp = self.client.chat.completions.create(
+            resp = self.smart_client.chat_completions_create(
+                step=0,
                 model=self.model_name,
                 messages=[
                     {"role": "system", "content": EVAL_SYSTEM_PROMPT},
@@ -581,7 +765,7 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v5.3.0] تشغيل...")
+    print("\n[Selfe Agent CI v5.4.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
@@ -609,23 +793,27 @@ def main():
     memory = MemoryManager(owner, repo, issue_number)
 
     try:
-        from openai import OpenAI, RateLimitError, AuthenticationError
+        from openai import OpenAI
     except ImportError:
         write_output("⚠️ مكتبة openai غير مثبتَّتة.")
         sys.exit(1)
 
-    cfg       = PROVIDER_CONFIG[model["provider"]]
-    client    = OpenAI(api_key=pkeys[0], base_url=cfg["base_url"])
-    evaluator = SelfEvaluator(owner, repo, client, model["name"])
+    cfg     = PROVIDER_CONFIG[model["provider"]]
 
-    # ── /push ─────────────────────────────────────────────
+    # ── إنشاء ErrorMonitor و SmartAPIClient ──────────────────
+    monitor      = ErrorMonitor(owner, repo, issue_number, model["name"])
+    smart_client = SmartAPIClient(pkeys, cfg["base_url"], model["name"], monitor)
+    evaluator    = SelfEvaluator(owner, repo, smart_client, model["name"])
+
+    # ── /push ─────────────────────────────────────────────────
     is_push, push_instruction = detect_push_command(msg)
     if is_push:
         print(f"[CI] /push — {push_instruction}")
         filename = extract_filename(push_instruction)
         for attempt in range(MAX_RETRIES):
             try:
-                resp = client.chat.completions.create(
+                resp = smart_client.chat_completions_create(
+                    step=0,
                     model=model["name"],
                     messages=[
                         {"role": "system", "content": PUSH_SYSTEM_PROMPT},
@@ -648,40 +836,38 @@ def main():
                 )
                 write_output(reply)
                 memory.save_turn(msg, reply, model["name"], tokens, 0.2, True)
+                monitor.flush_to_github()
                 return
             except Exception as e:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                else:
+                if attempt >= MAX_RETRIES - 1:
+                    monitor.flush_to_github()
                     write_output(f"⚠️ خطأ /push: {e}")
                     sys.exit(1)
 
-    # ── ReAct Loop (مهام معقدة) + SelfEval + Memory ────────
+    # ── ReAct Loop (مهام معقدة) + SelfEval + Memory ──────────
     if is_complex_task(msg):
         print(f"[CI] ✨ مهمة معقدة → تفعيل ReAct Loop")
         base_sp      = load_system_prompt(SYSTEM_PROMPT_FILE)
         data         = memory.load_issue_memory()
         current_turn = len(data.get("turns", [])) + 1
 
-        messages     = memory.build_messages(REACT_SYSTEM_PROMPT + "\n\n" + base_sp, msg)
+        messages = memory.build_messages(REACT_SYSTEM_PROMPT + "\n\n" + base_sp, msg)
         final_reply, total_tokens = react_loop(
-            client, model["name"], messages, owner, repo, max_steps=6
+            smart_client, model["name"], messages, owner, repo, max_steps=6
         )
 
-        # ── SelfEval على نتيجة ReAct ──────────────────────
         eval_result = evaluator.evaluate(msg, final_reply)
         score       = eval_result.get("score", 10)
         print(f"[SelfEval/ReAct] {score}/10")
 
-        # إذا النتيجة ضعيفة → محاولة واحدة إضافية بـ refined prompt
         if score < EVAL_THRESHOLD:
             print(f"[SelfEval/ReAct] ⚠ score={score} < {EVAL_THRESHOLD} → إعادة محاولة بـ refined prompt")
-            refined_sp  = evaluator.refine_system_prompt(
+            refined_sp = evaluator.refine_system_prompt(
                 REACT_SYSTEM_PROMPT + "\n\n" + base_sp, eval_result
             )
-            messages2   = memory.build_messages(refined_sp, msg)
+            messages2 = memory.build_messages(refined_sp, msg)
             retry_reply, retry_tokens = react_loop(
-                client, model["name"], messages2, owner, repo, max_steps=6
+                smart_client, model["name"], messages2, owner, repo, max_steps=6
             )
             eval_result2 = evaluator.evaluate(msg, retry_reply)
             score2       = eval_result2.get("score", 10)
@@ -692,7 +878,6 @@ def main():
                 total_tokens += retry_tokens
                 score         = score2
 
-        # تسجيل التقييم والإحصاءات
         evaluator.log_evaluation(
             issue_number, current_turn, msg, score,
             model["name"], attempt=0, improved=(score < EVAL_THRESHOLD)
@@ -707,10 +892,11 @@ def main():
             msg, final_reply, model["name"], total_tokens, 0.2,
             success=(score >= EVAL_THRESHOLD)
         )
+        monitor.flush_to_github()
         print(f"[CI] ReAct اكتمل ✔  (score={score})")
         return
 
-    # ── وضع عادي (Single-shot) + SelfEval + Memory ────────
+    # ── وضع عادي (Single-shot) + SelfEval + Memory ────────────
     base_system_prompt    = load_system_prompt(SYSTEM_PROMPT_FILE)
     temp                  = detect_temperature(msg)
     current_system_prompt = base_system_prompt
@@ -730,24 +916,21 @@ def main():
         reply    = None
         tokens   = 0
 
-        for api_attempt in range(MAX_RETRIES):
-            try:
-                resp   = client.chat.completions.create(
-                    model=model["name"],
-                    messages=messages,
-                    temperature=temp,
-                    max_tokens=4096,
-                )
-                reply  = resp.choices[0].message.content
-                tokens = getattr(resp.usage, "total_tokens", 0)
-                break
-            except Exception as e:
-                if api_attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** api_attempt)
-                else:
-                    write_output(f"⚠️ خطأ: {e}")
-                    memory.save_turn(msg, str(e), model["name"], 0, temp, False)
-                    sys.exit(1)
+        try:
+            resp = smart_client.chat_completions_create(
+                step=eval_attempt,
+                model=model["name"],
+                messages=messages,
+                temperature=temp,
+                max_tokens=4096,
+            )
+            reply  = resp.choices[0].message.content
+            tokens = getattr(resp.usage, "total_tokens", 0)
+        except Exception as e:
+            monitor.flush_to_github()
+            write_output(f"⚠️ خطأ: {e}")
+            memory.save_turn(msg, str(e), model["name"], 0, temp, False)
+            sys.exit(1)
 
         if reply is None:
             break
@@ -780,6 +963,7 @@ def main():
 
     write_output(final_reply)
     memory.save_turn(msg, final_reply, model["name"], final_tokens, temp, True)
+    monitor.flush_to_github()
     print("[CI] اكتمل ✔")
 
 
