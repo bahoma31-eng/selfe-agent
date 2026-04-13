@@ -1,4 +1,4 @@
-name: 🤖 Selfe Agent — Issue & Comment Trigger
+name: Selfe Agent - Issue and Comment Trigger
 
 on:
   issues:
@@ -8,7 +8,6 @@ on:
 
 jobs:
   run-selfe:
-    # منع الحلقة اللانهائية — تجاهل ردود الروبوت نفسه
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
@@ -32,27 +31,23 @@ jobs:
       - name: Install dependencies
         run: pip install openai>=1.0.0
 
-      # ── استخراج الرسالة حسب نوع الحدث ──────────────────
       - name: Extract message from Issue or Comment
         id: extract
         run: |
           if [ "${{ github.event_name }}" = "issues" ]; then
             TITLE="${{ github.event.issue.title }}"
             BODY="${{ github.event.issue.body }}"
-            MSG="العنوان: ${TITLE}
-
-المحتوى:
-${BODY}"
+            MSG=$(printf '%s\n\n%s' "$TITLE" "$BODY")
           else
             MSG="${{ github.event.comment.body }}"
           fi
           {
             echo "message<<EOF"
-            echo "$MSG"
+            printf '%s' "$MSG"
+            echo ""
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # ── تشغيل الوكيل (non-interactive) ──────────────────
       - name: Run Selfe Agent
         id: selfe
         env:
@@ -65,17 +60,16 @@ ${BODY}"
           MODEL_INDEX:      "1"
         run: python agent_ci.py
 
-      # ── نشر الرد كـ comment على الـ Issue ────────────────
       - name: Post Selfe reply as comment
         uses: actions/github-script@v7
         with:
           script: |
-            const reply = process.env.SELFE_REPLY || "⚠️ لم يتمكن الوكيل من توليد رد.";
+            const reply = process.env.SELFE_REPLY || "The agent could not generate a response.";
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo:  context.repo.repo,
               issue_number: context.issue.number,
-              body: `🤖 **Selfe Agent:**\n\n${reply}\n\n---\n*مُشغَّل تلقائياً بواسطة [Selfe Agent](https://github.com/bahoma31-eng/selfe-agent)*`
+              body: `🤖 **Selfe Agent:**\n\n${reply}\n\n---\n*Triggered automatically by [Selfe Agent](https://github.com/bahoma31-eng/selfe-agent)*`
             });
         env:
           SELFE_REPLY: ${{ steps.selfe.outputs.reply }}
