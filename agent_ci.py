@@ -1,7 +1,8 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v5.2.0 (نسخة GitHub Actions)
-# جديد v5.2.0: ReAct Loop كامل (parse_tool_call, execute_tool,
-#              react_loop, is_complex_task)
+# agent_ci.py — Selfe Agent v5.3.0 (نسخة GitHub Actions)
+# جديد v5.3.0: دمج SelfEval + Memory مع ReAct Loop كاملاً
+#   - المهام البسيطة  → Single-shot → SelfEval → Memory  (كما كان)
+#   - المهام المعقدة → ReAct Loop → SelfEval → Memory   (جديد)
 # =============================================================
 
 import os
@@ -92,7 +93,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/5.2.0",
+        "User-Agent": "selfe-agent/5.3.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -132,7 +133,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v5.2.0
+# ReAct Loop — v5.3.0
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -182,21 +183,18 @@ def is_complex_task(msg: str) -> bool:
     """يكتشف تلقائياً إذا كانت المهمة تحتاج ReAct Loop."""
     msg_lower = msg.lower()
     matched = sum(1 for kw in REACT_KEYWORDS if kw in msg_lower)
-    # إذا تطابقت كلمتان أو أكثر أو طول الرسالة > 300 حرف مع كلمة واحدة
     return matched >= 2 or (matched >= 1 and len(msg) > 300)
 
 
 def parse_tool_call(text: str) -> Optional[dict]:
     """يستخرج JSON أداة من رد النموذج."""
-    # نبحث عن ```json ... ``` block أولاً
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    # بحث عن JSON مباشر يحتوي على "tool"
-    m = re.search(r"(\{[^{}]*"tool"[^{}]*\})", text, re.DOTALL)
+    m = re.search(r"(\{[^{}]*\"tool\"[^{}]*\})", text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(1))
@@ -226,7 +224,6 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         content = read_file_from_github(owner, repo, path)
         if content is None:
             return f"❌ لم يُعثر على `{path}`."
-        # نقصر المحتوى إذا كان كبيراً تجنباً لتجاوز context window
         if len(content) > 8000:
             content = content[:8000] + "\n...[truncated]"
         return f"📄 محتوى `{path}`:\n```\n{content}\n```"
@@ -289,27 +286,22 @@ def react_loop(
 
         print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
 
-        # تحليل الأداة
         action = parse_tool_call(raw)
 
         if action is None:
-            # لا يوجد JSON → نعامله كرد نهائي
             log_steps.append(f"**Step {step}:** (no tool) {raw[:200]}…")
             return raw, total_tokens
 
         tool_name = action.get("tool", "")
         log_steps.append(f"**Step {step}:** tool=`{tool_name}`")
 
-        # إذا answer → انتهينا
         if tool_name == "answer":
             final = action.get("text", raw)
             return final, total_tokens
 
-        # تنفيذ الأداة
         observation = execute_tool(action, owner, repo)
         print(f"[ReAct] Observation: {observation[:200]}")
 
-        # إضافة التبادل إلى messages
         messages.append({"role": "assistant",  "content": raw})
         messages.append({"role": "user",       "content": f"Observation: {observation}"})
 
@@ -589,7 +581,7 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v5.2.0] تشغيل...")
+    print("\n[Selfe Agent CI v5.3.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
@@ -664,20 +656,61 @@ def main():
                     write_output(f"⚠️ خطأ /push: {e}")
                     sys.exit(1)
 
-    # ── ReAct Loop (مهام معقدة) ─────────────────────────────
+    # ── ReAct Loop (مهام معقدة) + SelfEval + Memory ────────
     if is_complex_task(msg):
         print(f"[CI] ✨ مهمة معقدة → تفعيل ReAct Loop")
-        base_sp  = load_system_prompt(SYSTEM_PROMPT_FILE)
-        messages = memory.build_messages(REACT_SYSTEM_PROMPT + "\n\n" + base_sp, msg)
+        base_sp      = load_system_prompt(SYSTEM_PROMPT_FILE)
+        data         = memory.load_issue_memory()
+        current_turn = len(data.get("turns", [])) + 1
+
+        messages     = memory.build_messages(REACT_SYSTEM_PROMPT + "\n\n" + base_sp, msg)
         final_reply, total_tokens = react_loop(
             client, model["name"], messages, owner, repo, max_steps=6
         )
+
+        # ── SelfEval على نتيجة ReAct ──────────────────────
+        eval_result = evaluator.evaluate(msg, final_reply)
+        score       = eval_result.get("score", 10)
+        print(f"[SelfEval/ReAct] {score}/10")
+
+        # إذا النتيجة ضعيفة → محاولة واحدة إضافية بـ refined prompt
+        if score < EVAL_THRESHOLD:
+            print(f"[SelfEval/ReAct] ⚠ score={score} < {EVAL_THRESHOLD} → إعادة محاولة بـ refined prompt")
+            refined_sp  = evaluator.refine_system_prompt(
+                REACT_SYSTEM_PROMPT + "\n\n" + base_sp, eval_result
+            )
+            messages2   = memory.build_messages(refined_sp, msg)
+            retry_reply, retry_tokens = react_loop(
+                client, model["name"], messages2, owner, repo, max_steps=6
+            )
+            eval_result2 = evaluator.evaluate(msg, retry_reply)
+            score2       = eval_result2.get("score", 10)
+            print(f"[SelfEval/ReAct] retry → {score2}/10")
+
+            if score2 > score:
+                final_reply   = retry_reply
+                total_tokens += retry_tokens
+                score         = score2
+
+        # تسجيل التقييم والإحصاءات
+        evaluator.log_evaluation(
+            issue_number, current_turn, msg, score,
+            model["name"], attempt=0, improved=(score < EVAL_THRESHOLD)
+        )
+        evaluator.update_prompt_stats(score, improved=(score < EVAL_THRESHOLD))
+
+        if score < EVAL_THRESHOLD:
+            final_reply += f"\n\n---\n> ⚠️ *أفضل تقييم ذاتي: {score}/10*"
+
         write_output(final_reply)
-        memory.save_turn(msg, final_reply, model["name"], total_tokens, 0.2, True)
-        print("[CI] ReAct اكتمل ✔")
+        memory.save_turn(
+            msg, final_reply, model["name"], total_tokens, 0.2,
+            success=(score >= EVAL_THRESHOLD)
+        )
+        print(f"[CI] ReAct اكتمل ✔  (score={score})")
         return
 
-    # ── وضع عادي ─────────────────────────────────────────
+    # ── وضع عادي (Single-shot) + SelfEval + Memory ────────
     base_system_prompt    = load_system_prompt(SYSTEM_PROMPT_FILE)
     temp                  = detect_temperature(msg)
     current_system_prompt = base_system_prompt
