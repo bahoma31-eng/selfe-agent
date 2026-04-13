@@ -61,6 +61,7 @@ jobs:
           MODEL_INDEX:        "1"
           GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY:  ${{ github.repository }}
+          ISSUE_NUMBER:       ${{ github.event.issue.number || github.event.comment.issue_url }}
         run: python agent_ci.py
 
       - name: Post Selfe reply as comment
