@@ -1,7 +1,7 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v5.1.0 (نسخة GitHub Actions)
-# تعمل بدون تفاعل (non-interactive)
-# جديد v5.1.0: ToolRegistry مدمج
+# agent_ci.py — Selfe Agent v5.2.0 (نسخة GitHub Actions)
+# جديد v5.2.0: ReAct Loop كامل (parse_tool_call, execute_tool,
+#              react_loop, is_complex_task)
 # =============================================================
 
 import os
@@ -10,7 +10,6 @@ import time
 import re
 import json
 import base64
-import inspect
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -41,9 +40,9 @@ PROVIDER_CONFIG = {
     },
 }
 
-# -------------------------------------------------------------------
-# ToolRegistry (v5.1.0)
-# -------------------------------------------------------------------
+# ===================================================================
+# ToolRegistry
+# ===================================================================
 
 ToolType = TypeVar('ToolType', bound=Callable[..., Any])
 
@@ -79,9 +78,9 @@ class ToolRegistry:
         return f"ToolRegistry({', '.join(self.list_tool_names())})"
 
 
-# -------------------------------------------------------------------
+# ===================================================================
 # أدوات GitHub API
-# -------------------------------------------------------------------
+# ===================================================================
 
 def _github_request(method: str, path: str, data: dict = None) -> dict:
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -93,10 +92,10 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/5.1.0",
+        "User-Agent": "selfe-agent/5.2.0",
     }
     body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    req  = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read().decode())
@@ -132,9 +131,207 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
         return None
 
 
-# -------------------------------------------------------------------
+# ===================================================================
+# ReAct Loop — v5.2.0
+# ===================================================================
+
+REACT_SYSTEM_PROMPT = """\
+أنت Selfe، وكيل ذكاء اصطناعي متقدّم.
+لديك صلاحية استخدام الأدوات التالية:
+
+1. push_file   — رفع ملف إلى GitHub
+2. read_file   — قراءة ملف من GitHub
+3. list_files  — عرض قائمة الملفات في مجلد
+4. answer      — إرجاع الرد النهائي للمستخدم
+
+فورمات استخدام الأدوات (اكتب واحدةً فقط في كل رد):
+
+للقراءة:
+```json
+{"tool": "read_file", "path": "<مسار الملف>"}
+```
+لعرض الملفات:
+```json
+{"tool": "list_files", "path": "<المجلد>"}
+```
+للرفع:
+```json
+{"tool": "push_file", "path": "<مسار>", "content": "<المحتوى>", "message": "<رسالة commit>"}
+```
+للإجابة النهائية:
+```json
+{"tool": "answer", "text": "<ردك النهائي هنا>"}
+```
+
+قواعد مهمة:
+- اكتب دائما JSON داخل ```json ... ``` فقط
+- لا تكتب أداتين في نفس الرد
+- إذا لم تحتج أدوات، استخدم answer مباشرة
+"""
+
+# كلمات تشير إلى مهمة معقدة تحتاج ReAct
+REACT_KEYWORDS = [
+    "ثم", "بعد ذلك", "حلّل", "اقرأ", "تحقّق",
+    "خطوات", "عدة", "أولاً", "ثانياً", "ثالثاً",
+    "افحص", "عدل", "راجع",
+    "then", "after that", "analyze", "check", "read", "steps", "multiple",
+]
+
+
+def is_complex_task(msg: str) -> bool:
+    """يكتشف تلقائياً إذا كانت المهمة تحتاج ReAct Loop."""
+    msg_lower = msg.lower()
+    matched = sum(1 for kw in REACT_KEYWORDS if kw in msg_lower)
+    # إذا تطابقت كلمتان أو أكثر أو طول الرسالة > 300 حرف مع كلمة واحدة
+    return matched >= 2 or (matched >= 1 and len(msg) > 300)
+
+
+def parse_tool_call(text: str) -> Optional[dict]:
+    """يستخرج JSON أداة من رد النموذج."""
+    # نبحث عن ```json ... ``` block أولاً
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    # بحث عن JSON مباشر يحتوي على "tool"
+    m = re.search(r"(\{[^{}]*"tool"[^{}]*\})", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def execute_tool(action: dict, owner: str, repo: str) -> str:
+    """ينفّذ الأداة ويرجع نتيجة نصية."""
+    tool = action.get("tool", "")
+
+    if tool == "push_file":
+        path    = action.get("path", "output.txt")
+        content = action.get("content", "")
+        message = action.get("message", f"feat: push {path} via Selfe Agent")
+        try:
+            commit_url = push_file_to_github(owner, repo, path, content, message)
+            return f"✅ تم رفع `{path}` بنجاح.\ncommit: {commit_url}"
+        except Exception as e:
+            return f"❌ فشل push_file: {e}"
+
+    elif tool == "read_file":
+        path = action.get("path", "")
+        if not path:
+            return "❌ يجب تحديد path."
+        content = read_file_from_github(owner, repo, path)
+        if content is None:
+            return f"❌ لم يُعثر على `{path}`."
+        # نقصر المحتوى إذا كان كبيراً تجنباً لتجاوز context window
+        if len(content) > 8000:
+            content = content[:8000] + "\n...[truncated]"
+        return f"📄 محتوى `{path}`:\n```\n{content}\n```"
+
+    elif tool == "list_files":
+        path = action.get("path", "")
+        api_path = f"/repos/{owner}/{repo}/contents"
+        if path and path != "/":
+            api_path += f"/{path.strip('/')}"
+        try:
+            items = _github_request("GET", api_path)
+            if not isinstance(items, list):
+                return f"❌ لم يُعثر على المجلد `{path}`."
+            lines = []
+            for item in items:
+                icon = "📁" if item.get("type") == "dir" else "📄"
+                lines.append(f"{icon} {item['name']}")
+            return f"📂 محتويات `{'/' if not path else path}`:\n" + "\n".join(lines)
+        except Exception as e:
+            return f"❌ خطأ list_files: {e}"
+
+    elif tool == "answer":
+        return action.get("text", "")
+
+    else:
+        return f"⚠️ أداة غير معروفة: `{tool}`"
+
+
+def react_loop(
+    client,
+    model_name: str,
+    messages: list,
+    owner: str,
+    repo: str,
+    max_steps: int = 6,
+) -> tuple:
+    """
+    دورة ReAct:
+      Thought → Action (JSON) → Observation → ... → answer
+    ترجع (final_reply: str, total_tokens: int)
+    """
+    total_tokens = 0
+    log_steps    = []
+
+    for step in range(1, max_steps + 1):
+        print(f"[ReAct] خطوة {step}/{max_steps}")
+
+        try:
+            resp   = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=4096,
+            )
+            raw    = resp.choices[0].message.content
+            tokens = getattr(resp.usage, "total_tokens", 0)
+            total_tokens += tokens
+        except Exception as e:
+            return f"⚠️ خطأ ReAct API: {e}", total_tokens
+
+        print(f"[ReAct] رد النموذج:\n{raw[:300]}...")
+
+        # تحليل الأداة
+        action = parse_tool_call(raw)
+
+        if action is None:
+            # لا يوجد JSON → نعامله كرد نهائي
+            log_steps.append(f"**Step {step}:** (no tool) {raw[:200]}…")
+            return raw, total_tokens
+
+        tool_name = action.get("tool", "")
+        log_steps.append(f"**Step {step}:** tool=`{tool_name}`")
+
+        # إذا answer → انتهينا
+        if tool_name == "answer":
+            final = action.get("text", raw)
+            return final, total_tokens
+
+        # تنفيذ الأداة
+        observation = execute_tool(action, owner, repo)
+        print(f"[ReAct] Observation: {observation[:200]}")
+
+        # إضافة التبادل إلى messages
+        messages.append({"role": "assistant",  "content": raw})
+        messages.append({"role": "user",       "content": f"Observation: {observation}"})
+
+    # بلغنا max_steps — نطلب رداً نهائياً
+    messages.append({"role": "user", "content": "لقد انتهت جميع الخطوات. أجب بشكل نهائي باستخدام tool=answer."})
+    try:
+        resp   = client.chat.completions.create(
+            model=model_name, messages=messages, temperature=0.3, max_tokens=2048,
+        )
+        raw    = resp.choices[0].message.content
+        total_tokens += getattr(resp.usage, "total_tokens", 0)
+        action = parse_tool_call(raw)
+        if action and action.get("tool") == "answer":
+            return action.get("text", raw), total_tokens
+        return raw, total_tokens
+    except Exception as e:
+        return f"⚠️ خطأ ReAct نهايي: {e}", total_tokens
+
+
+# ===================================================================
 # MemoryManager
-# -------------------------------------------------------------------
+# ===================================================================
 
 class MemoryManager:
     def __init__(self, owner, repo, issue_number):
@@ -169,8 +366,8 @@ class MemoryManager:
         if recent:
             messages[0]["content"] += f"\n\n## سياق آخر {len(recent)} تفاعل:\n"
         for t in recent:
-            messages.append({"role": "user",      "content": t["user"]})
-            messages.append({"role": "assistant",  "content": t["agent"]})
+            messages.append({"role": "user",     "content": t["user"]})
+            messages.append({"role": "assistant", "content": t["agent"]})
         messages.append({"role": "user", "content": current_msg})
         return messages
 
@@ -212,9 +409,9 @@ class MemoryManager:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# -------------------------------------------------------------------
+# ===================================================================
 # SelfEvaluator
-# -------------------------------------------------------------------
+# ===================================================================
 
 EVAL_SYSTEM_PROMPT = """أنت مُقيّم موضوعي. قيّم الرد من 0 إلى 10.
 أجب بـ JSON فقط:
@@ -256,10 +453,10 @@ class SelfEvaluator:
         return original_prompt + "\n\n## توجيهات تلقائية:\n" + "\n".join(f"- {l}" for l in lines)
 
     def log_evaluation(self, issue_number, turn, user_msg, score, model_name, attempt, improved):
-        entry   = json.dumps({"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                              "issue": issue_number, "turn": turn, "model": model_name,
-                              "score": score, "attempt": attempt, "improved": improved},
-                             ensure_ascii=False)
+        entry    = json.dumps({"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                               "issue": issue_number, "turn": turn, "model": model_name,
+                               "score": score, "attempt": attempt, "improved": improved},
+                              ensure_ascii=False)
         existing = read_file_from_github(self.owner, self.repo, EVAL_LOG_PATH) or ""
         try:
             push_file_to_github(self.owner, self.repo, EVAL_LOG_PATH,
@@ -290,9 +487,9 @@ class SelfEvaluator:
             print(f"[SelfEval] ⚠ stats: {e}")
 
 
-# -------------------------------------------------------------------
+# ===================================================================
 # كشف أمر /push
-# -------------------------------------------------------------------
+# ===================================================================
 
 PUSH_PATTERN       = re.compile(r"^/push\s+(.+)$", re.IGNORECASE | re.MULTILINE)
 FILE_NAME_PATTERN  = re.compile(r"\b([\w\-/]+\.\w+)\b")
@@ -308,8 +505,8 @@ def extract_filename(instruction):
     m = FILE_NAME_PATTERN.search(instruction)
     if m:
         return m.group(1)
-    words   = re.sub(r"[^\w\s]", "", instruction).split()
-    slug    = "_".join(words[:4]).lower() if words else "script"
+    words    = re.sub(r"[^\w\s]", "", instruction).split()
+    slug     = "_".join(words[:4]).lower() if words else "script"
     lang_map = {"python": ".py", "py": ".py", "javascript": ".js", "js": ".js",
                 "typescript": ".ts", "ts": ".ts", "bash": ".sh", "shell": ".sh",
                 "html": ".html", "css": ".css", "yaml": ".yml", "json": ".json"}
@@ -324,9 +521,9 @@ def extract_code_from_reply(reply):
     return blocks[0].strip() if blocks else reply.strip()
 
 
-# -------------------------------------------------------------------
+# ===================================================================
 # دوال مشتركة
-# -------------------------------------------------------------------
+# ===================================================================
 
 def load_system_prompt(filepath):
     default = "أنت Selfe، وكيل ذكاء اصطناعي متخصص في تطوير البرمجيات."
@@ -387,12 +584,12 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 ```"""
 
 
-# -------------------------------------------------------------------
+# ===================================================================
 # main
-# -------------------------------------------------------------------
+# ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v5.1.0] تشغيل...")
+    print("\n[Selfe Agent CI v5.2.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
@@ -425,17 +622,15 @@ def main():
         write_output("⚠️ مكتبة openai غير مثبتَّتة.")
         sys.exit(1)
 
-    cfg    = PROVIDER_CONFIG[model["provider"]]
-    client = OpenAI(api_key=pkeys[0], base_url=cfg["base_url"])
+    cfg       = PROVIDER_CONFIG[model["provider"]]
+    client    = OpenAI(api_key=pkeys[0], base_url=cfg["base_url"])
     evaluator = SelfEvaluator(owner, repo, client, model["name"])
 
-    # ── /push ───────────────────────────────────────────────
+    # ── /push ─────────────────────────────────────────────
     is_push, push_instruction = detect_push_command(msg)
-
     if is_push:
         print(f"[CI] /push — {push_instruction}")
         filename = extract_filename(push_instruction)
-
         for attempt in range(MAX_RETRIES):
             try:
                 resp = client.chat.completions.create(
@@ -449,7 +644,6 @@ def main():
                 raw_reply  = resp.choices[0].message.content
                 clean_code = extract_code_from_reply(raw_reply)
                 tokens     = getattr(resp.usage, "total_tokens", 0)
-
                 commit_url = push_file_to_github(
                     owner, repo, filename, clean_code,
                     f"feat({filename}): generated by Selfe Agent via /push",
@@ -463,13 +657,6 @@ def main():
                 write_output(reply)
                 memory.save_turn(msg, reply, model["name"], tokens, 0.2, True)
                 return
-
-            except RateLimitError:
-                write_output("⚠️ Rate Limit. حاول لاحقاً.")
-                sys.exit(1)
-            except AuthenticationError:
-                write_output("⚠️ مفتاح API غير صالح.")
-                sys.exit(1)
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
@@ -477,7 +664,20 @@ def main():
                     write_output(f"⚠️ خطأ /push: {e}")
                     sys.exit(1)
 
-    # ── وضع عادي ───────────────────────────────────────────
+    # ── ReAct Loop (مهام معقدة) ─────────────────────────────
+    if is_complex_task(msg):
+        print(f"[CI] ✨ مهمة معقدة → تفعيل ReAct Loop")
+        base_sp  = load_system_prompt(SYSTEM_PROMPT_FILE)
+        messages = memory.build_messages(REACT_SYSTEM_PROMPT + "\n\n" + base_sp, msg)
+        final_reply, total_tokens = react_loop(
+            client, model["name"], messages, owner, repo, max_steps=6
+        )
+        write_output(final_reply)
+        memory.save_turn(msg, final_reply, model["name"], total_tokens, 0.2, True)
+        print("[CI] ReAct اكتمل ✔")
+        return
+
+    # ── وضع عادي ─────────────────────────────────────────
     base_system_prompt    = load_system_prompt(SYSTEM_PROMPT_FILE)
     temp                  = detect_temperature(msg)
     current_system_prompt = base_system_prompt
@@ -508,12 +708,6 @@ def main():
                 reply  = resp.choices[0].message.content
                 tokens = getattr(resp.usage, "total_tokens", 0)
                 break
-            except RateLimitError:
-                write_output("⚠️ Rate Limit.")
-                sys.exit(1)
-            except AuthenticationError:
-                write_output("⚠️ Auth Error.")
-                sys.exit(1)
             except Exception as e:
                 if api_attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** api_attempt)
