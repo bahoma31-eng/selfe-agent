@@ -3,10 +3,10 @@ import sys
 import time
 
 # =========================================================
-# Selfe Agent v3.1.0
+# Selfe Agent v3.2.0
 # يدعم مفاتيح متعددة:
-#   GEMINI_API_KEY_1 .. GEMINI_API_KEY_4  → نماذج Gemini
-#   GROQ_API_KEY                          → نماذج Groq
+#   GEMINI_API_KEY_1 .. GEMINI_API_KEY_7  → نماذج Gemini
+#   GROQ_API_KEY_1 .. GROQ_API_KEY_2      → نماذج Groq
 # النماذج     → models.txt
 # البرومبت    → system_prompt.txt  (افتراضي)
 # المهارات    → skills.txt  (جلب SKILL.md من GitHub)
@@ -15,6 +15,9 @@ import time
 #   - temperature ديناميكية حسب نوع الطلب
 #   - max_tokens=4096 لمنع القطع
 #   - آلية retry مع Exponential Backoff
+# [v3.2.0] إضافة 5 مفاتيح API جديدة:
+#   - Gemini: من 4 مفاتيح إلى 7 مفاتيح (GEMINI_API_KEY_5/6/7)
+#   - Groq:   من مفتاح واحد إلى 2 مفاتيح مع تناوب تلقائي
 # =========================================================
 
 import re
@@ -32,13 +35,15 @@ PROVIDER_CONFIG = {
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "secret_vars": ["GEMINI_API_KEY_1", "GEMINI_API_KEY_2",
-                        "GEMINI_API_KEY_3", "GEMINI_API_KEY_4"],
+                        "GEMINI_API_KEY_3", "GEMINI_API_KEY_4",
+                        "GEMINI_API_KEY_5", "GEMINI_API_KEY_6",
+                        "GEMINI_API_KEY_7"],
         "rotate": True,
     },
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
-        "secret_vars": ["GROQ_API_KEY"],
-        "rotate": False,
+        "secret_vars": ["GROQ_API_KEY_1", "GROQ_API_KEY_2"],
+        "rotate": True,
     },
 }
 
@@ -113,7 +118,7 @@ def fetch_skill(url: str) -> str:
     يستخدم urllib (بدون مكتبات خارجية).
     """
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "selfe-agent/3.1"})
+        req = urllib.request.Request(url, headers={"User-Agent": "selfe-agent/3.2"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.read().decode("utf-8")
     except Exception as e:
@@ -310,7 +315,7 @@ HELP_TEXT = """
 
 def main():
     print("\n╔══════════════════════════════╗")
-    print("║       Selfe Agent v3.1.0     ║")
+    print("║       Selfe Agent v3.2.0     ║")
     print("╚══════════════════════════════╝")
 
     # 1. تحميل المهارات
@@ -337,7 +342,7 @@ def main():
     # 5. اختيار النموذج
     model_info = select_model(models)
     print(f"\n[OK] النموذج : {model_info['name']}  |المزود: {model_info['provider']}")
-    print("\nاكتب 'مساعدة' لعرض جميع الأوامر.\n")
+    print("\naكتب 'مساعدة' لعرض جميع الأوامر.\n")
 
     # 6. حلقة المحادثة
     history: list[dict] = [{"role": "system", "content": system_prompt}]
