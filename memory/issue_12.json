@@ -1,0 +1,17 @@
+{
+  "issue_number": "12",
+  "created_at": "2026-04-14T21:09:21Z",
+  "turns": [
+    {
+      "turn": 1,
+      "timestamp": "2026-04-14T21:09:28Z",
+      "user": "ابعث رسالة الكترونية الى bahoma31@gmail.com",
+      "agent": "```json\n{\"tool\": \"answer\", \"text\": \"@run أرسل بريداً إلى bahoma31@gmail.com بموضوع 'رسالة من Selfe' وبمحتوى 'مرحباً، هذه رسالة تجريبية من Selfe، وكيل الذكاء الاصطناعي.' وفي نهاية الرسالة أضف تحياتي\"}\n```",
+      "model": "gemini-2.5-flash",
+      "tokens": 1986,
+      "temperature": 0.7,
+      "success": true
+    }
+  ],
+  "updated_at": "2026-04-14T21:09:28Z"
+}
