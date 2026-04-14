@@ -1,5 +1,5 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v6.4.0
+# agent_ci.py — Selfe Agent v6.5.0
 # إصلاح شامل: فصل طبقات الفشل + Retry ذكي + ReAct محسّن
 # v6.1.1: إصلاح TypeError عند raw=None (choices[0].message.content)
 # v6.1.0: 3 حلول لاستنزاف حصة API:
@@ -16,6 +16,10 @@
 #   2. إضافة validate_execution_result للتحقق من نجاح حقيقي
 #   3. إضافة check_required_env قبل تشغيل السكريبتات الخارجية
 #   4. تصليح parse_tool_call: رفض JSON خارج code fence
+# v6.5.0: ثلاثة تحسينات:
+#   1. إضافة أداة send_email مباشرة في execute_tool
+#   2. إضافة send_email لجدول الأدوات في REACT_SYSTEM_PROMPT + مثال
+#   3. تخفيف parse_tool_call: قبول JSON خارج code fence كخطة بديلة
 # =============================================================
 
 import os
@@ -422,7 +426,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/6.4.0",
+        "User-Agent": "selfe-agent/6.5.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -462,7 +466,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v6.4.0
+# ReAct Loop — v6.5.0
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -477,6 +481,7 @@ REACT_SYSTEM_PROMPT = """\
 | list_files    | عرض الملفات والمجلدات                                    |
 | search_files  | البحث عن ملف بالاسم في المستودع                          |
 | run_script    | كتابة وتنفيذ سكريبت Python مباشرةً داخل بيئة التشغيل    |
+| send_email    | إرسال بريد إلكتروني مباشرةً                              |
 | answer        | إرجاع الرد النهائي للمستخدم                              |
 
 ## صيغة الاستخدام (إلزامية)
@@ -504,13 +509,17 @@ REACT_SYSTEM_PROMPT = """\
 ```
 
 ```json
+{"tool": "send_email", "to": "bahoma31@gmail.com", "subject": "تقرير", "body": "مرحباً..."}
+```
+
+```json
 {"tool": "answer", "text": "ردك النهائي هنا"}
 ```
 
 ## مبدأ الاكتفاء الذاتي — القاعدة الأساسية
 
 إذا طُلب منك تنفيذ عملية لا تملك أداةً مُعرَّفة لها مسبقاً
-(مثل: إرسال بريد إلكتروني، النشر على فيسبوك، إرسال رسالة Telegram،
+(مثل: النشر على فيسبوك، إرسال رسالة Telegram،
 استدعاء API خارجي، إرسال SMS، جدولة مهمة...)
 
 **لا تقل أنك عاجز. بل:**
@@ -540,23 +549,9 @@ REACT_SYSTEM_PROMPT = """\
 
 ### أمثلة تطبيقية — ماذا يكتب الوكيل بنفسه
 
-**مثال 1 — إرسال بريد إلكتروني (استخدم SMTP_PASS وليس SMTP_PASSWORD):**
-```python
-import smtplib, os
-from email.mime.text import MIMEText
-smtp_user = os.environ.get("SMTP_USER", "")
-smtp_pass = os.environ.get("SMTP_PASS", "")
-if not smtp_user or not smtp_pass:
-    print("❌ SMTP_USER أو SMTP_PASS غير موجودَين في البيئة")
-else:
-    msg = MIMEText("محتوى الرسالة", "plain", "utf-8")
-    msg["Subject"] = "تقرير من Selfe Agent"
-    msg["From"] = smtp_user
-    msg["To"] = "user@example.com"
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(smtp_user, smtp_pass)
-        s.send_message(msg)
-    print(f"✅ البريد أُرسل بنجاح من {smtp_user}")
+**مثال 1 — إرسال بريد إلكتروني عبر أداة send_email:**
+```json
+{"tool": "send_email", "to": "user@example.com", "subject": "تقرير من Selfe Agent", "body": "مرحباً، هذا تقريرك اليومي."}
 ```
 
 **مثال 2 — النشر على فيسبوك:**
@@ -584,7 +579,7 @@ else:
 ## قواعد صارمة — لا استثناء
 
 1. **أداة واحدة فقط** في كل رد. لا أداتين معاً أبداً.
-2. **JSON داخل ```json ... ```** دائماً — لا تكتب JSON خارج code fence أبداً.
+2. **JSON داخل ```json ... ```** دائماً — يُفضَّل دائماً استخدام code fence.
 3. **لا تتوقف قبل الإجابة النهائية** — استخدم tool=answer فقط عندما تنتهي من جميع خطوات المهمة.
 4. **إذا فشلت أداة** — انتقل لأداة بديلة أو غيّر المسار، ولا تكرر نفس الخطأ.
 5. **لا تكتب أي نص** قبل JSON أو بعده في نفس الرد.
@@ -619,9 +614,11 @@ def is_complex_task(msg: str) -> bool:
 
 def parse_tool_call(text: str) -> Optional[dict]:
     """
-    v6.4.0: يقبل JSON فقط داخل ```json ... ``` — يرفض JSON خارج code fence
-    لمنع هلوسة الأدوات عند ظهور JSON عشوائي في ردود النموذج.
+    v6.5.0: يقبل JSON داخل ```json ... ``` أولاً (الطريقة المفضّلة).
+    إذا لم يُعثر عليه، يبحث عن JSON مستقل خارج code fence كخطة بديلة
+    لدعم النماذج التي لا تُغلّف JSON دائماً بـ code fence.
     """
+    # المسار الأول: JSON داخل code fence (مفضّل)
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         try:
@@ -630,6 +627,17 @@ def parse_tool_call(text: str) -> Optional[dict]:
                 return parsed
         except json.JSONDecodeError:
             pass
+
+    # المسار الثاني: JSON خارج code fence (خطة بديلة)
+    m2 = re.search(r"(\{[^{}]*\"tool\"[^{}]*\})", text, re.DOTALL)
+    if m2:
+        try:
+            parsed = json.loads(m2.group(1))
+            if "tool" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
     return None
 
 
@@ -740,13 +748,42 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         # v6.4.0: التحقق من النتيجة
         return validate_execution_result(raw_output, action)
 
+    elif tool == "send_email":
+        # v6.5.0: أداة إرسال البريد الإلكتروني المباشرة
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        smtp_user = os.environ.get("SMTP_USER", "")
+        smtp_pass = os.environ.get("SMTP_PASS", "")
+        to        = action.get("to", "")
+        subject   = action.get("subject", "رسالة من Selfe Agent")
+        body      = action.get("body", "")
+        if not smtp_user or not smtp_pass:
+            return "❌ SMTP_USER أو SMTP_PASS غير موجودَين."
+        if not to:
+            return "❌ يجب تحديد عنوان المستلم في حقل 'to'."
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["From"]    = smtp_user
+            msg["To"]      = to
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            with smtplib.SMTP("smtp.gmail.com", 587) as s:
+                s.ehlo()
+                s.starttls()
+                s.login(smtp_user, smtp_pass)
+                s.sendmail(smtp_user, to, msg.as_string())
+            return f"✅ تم إرسال البريد إلى {to} بنجاح."
+        except Exception as e:
+            return f"❌ فشل إرسال البريد: {e}"
+
     elif tool == "answer":
         return action.get("text", "")
 
     else:
         return (
             f"⚠️ أداة غير معروفة: `{tool}`. "
-            f"الأدوات المتاحة: read_file, push_file, list_files, search_files, run_script, answer"
+            f"الأدوات المتاحة: read_file, push_file, list_files, search_files, run_script, send_email, answer"
         )
 
 
@@ -1143,11 +1180,11 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 
 
 # ===================================================================
-# main — v6.4.0
+# main — v6.5.0
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v6.4.0] تشغيل...")
+    print("\n[Selfe Agent CI v6.5.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
