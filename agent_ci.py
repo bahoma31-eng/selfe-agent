@@ -1,5 +1,5 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v6.3.0
+# agent_ci.py — Selfe Agent v6.4.0
 # إصلاح شامل: فصل طبقات الفشل + Retry ذكي + ReAct محسّن
 # v6.1.1: إصلاح TypeError عند raw=None (choices[0].message.content)
 # v6.1.0: 3 حلول لاستنزاف حصة API:
@@ -11,6 +11,11 @@
 # v6.3.0: مبدأ الاكتفاء الذاتي — الوكيل يكتب سكريبتاته بنفسه
 #         ويستعمل المفاتيح السرية من GitHub Secrets مباشرةً
 #         دون الحاجة لأدوات مُعرَّفة مسبقاً (إرسال بريد، نشر فيسبوك...)
+# v6.4.0: إصلاح هلوسة الأدوات:
+#   1. توحيد اسم المتغير SMTP_PASSWORD → SMTP_PASS
+#   2. إضافة validate_execution_result للتحقق من نجاح حقيقي
+#   3. إضافة check_required_env قبل تشغيل السكريبتات الخارجية
+#   4. تصليح parse_tool_call: رفض JSON خارج code fence
 # =============================================================
 
 import os
@@ -41,6 +46,9 @@ PROVIDER_CONFIG = {
         "secret_vars": [
             "GEMINI_API_KEY_1", "GEMINI_API_KEY_2",
             "GEMINI_API_KEY_3", "GEMINI_API_KEY_4",
+            "GEMINI_API_KEY_5", "GEMINI_API_KEY_6",
+            "GEMINI_API_KEY_7", "GEMINI_API_KEY_8",
+            "GEMINI_API_KEY_9",
         ],
     },
     "groq": {
@@ -64,6 +72,73 @@ QUOTA_EXHAUSTED_PATTERNS = [
     "daily limit",
     "monthly limit",
 ]
+
+# ===================================================================
+# قاموس المتغيرات البيئية المطلوبة لكل خدمة خارجية — v6.4.0
+# ملاحظة: SMTP_PASS (لا SMTP_PASSWORD) ليتوافق مع GitHub Secrets
+# ===================================================================
+
+REQUIRED_ENV_VARS = {
+    "email":    ["SMTP_USER", "SMTP_PASS"],
+    "facebook": ["FB_PAGE_ACCESS_TOKEN", "FB_PAGE_ID"],
+    "telegram": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"],
+    "twilio":   ["TWILIO_AUTH_TOKEN", "TWILIO_ACCOUNT_SID"],
+    "imgbb":    ["IMGBB_API_KEY"],
+}
+
+SERVICE_KEYWORDS = {
+    "email":    ["smtp", "sendmail", "smtplib", "send_message", "mime"],
+    "facebook": ["graph.facebook", "fb_page", "fb_access"],
+    "telegram": ["api.telegram", "telegram_bot"],
+    "twilio":   ["twilio"],
+    "imgbb":    ["imgbb", "api.imgbb"],
+}
+
+
+def check_required_env(service: str):
+    """يتحقق من وجود المتغيرات البيئية للخدمة المطلوبة."""
+    required = REQUIRED_ENV_VARS.get(service.lower(), [])
+    missing = [v for v in required if not os.environ.get(v, "").strip()]
+    if missing:
+        return False, (
+            f"❌ متغيرات بيئية مفقودة لخدمة '{service}': {', '.join(missing)}\n"
+            f"أضفها كـ GitHub Secrets ثم أعد تشغيل المهمة."
+        )
+    return True, ""
+
+
+def detect_service_in_code(code: str) -> Optional[str]:
+    """يكشف الخدمة الخارجية المستهدفة من كود السكريبت."""
+    code_lower = code.lower()
+    for service, keywords in SERVICE_KEYWORDS.items():
+        if any(kw in code_lower for kw in keywords):
+            return service
+    return None
+
+
+def validate_execution_result(output: str, action: dict) -> str:
+    """
+    يتحقق من أن نتيجة التنفيذ تدل على نجاح حقيقي، لا مجرد غياب خطأ.
+    """
+    code = action.get("code", "")
+    service = detect_service_in_code(code)
+
+    # إذا كان الإخراج يحتوي على ✅ لكن قصير جداً → مشبوه
+    if "✅" in output and len(output.strip()) < 35:
+        return (
+            "⚠️ تحذير: يبدو أن السكريبت نجح لكن لم يُنتج دليلاً واضحاً على الإنجاز.\n"
+            f"{output}\n"
+            "يُرجى التحقق من المتغيرات البيئية المطلوبة وإعادة المحاولة."
+        )
+
+    # إذا كان مرتبطاً بخدمة → تحقق من المتغيرات قبل الإعلان عن النجاح
+    if service:
+        ok, err_msg = check_required_env(service)
+        if not ok:
+            return err_msg
+
+    return output
+
 
 # ===================================================================
 # استراتيجية Retry المخصصة لكل كود HTTP
@@ -168,7 +243,7 @@ class ErrorMonitor:
 
 
 # ===================================================================
-# SmartAPIClient — v6.3.0
+# SmartAPIClient — v6.4.0
 # ===================================================================
 
 class SmartAPIClient:
@@ -347,7 +422,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/6.3.0",
+        "User-Agent": "selfe-agent/6.4.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -387,7 +462,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v6.3.0
+# ReAct Loop — v6.4.0
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -432,7 +507,7 @@ REACT_SYSTEM_PROMPT = """\
 {"tool": "answer", "text": "ردك النهائي هنا"}
 ```
 
-## مبدأ الاكتفاء الذاتي — القاعدة الأساسية الجديدة
+## مبدأ الاكتفاء الذاتي — القاعدة الأساسية
 
 إذا طُلب منك تنفيذ عملية لا تملك أداةً مُعرَّفة لها مسبقاً
 (مثل: إرسال بريد إلكتروني، النشر على فيسبوك، إرسال رسالة Telegram،
@@ -452,62 +527,70 @@ REACT_SYSTEM_PROMPT = """\
 | المفتاح               | الاستخدام                              |
 |----------------------|----------------------------------------|
 | GITHUB_TOKEN         | GitHub API — متاح دائماً              |
-| GEMINI_API_KEY_1..4  | نماذج Gemini                           |
+| GEMINI_API_KEY_1..9  | نماذج Gemini                           |
 | GROQ_API_KEY         | نماذج Groq / LLaMA                    |
-| SMTP_PASSWORD        | إرسال البريد الإلكتروني (إن وُجد)     |
-| SMTP_USER            | حساب البريد المُرسِل (إن وُجد)        |
-| FB_ACCESS_TOKEN      | Facebook Graph API (إن وُجد)           |
-| TELEGRAM_BOT_TOKEN   | Telegram Bot API (إن وُجد)             |
-| TWILIO_AUTH_TOKEN    | Twilio SMS/WhatsApp (إن وُجد)          |
-| TWILIO_ACCOUNT_SID   | Twilio Account SID (إن وُجد)           |
+| SMTP_PASS            | إرسال البريد الإلكتروني               |
+| SMTP_USER            | حساب البريد المُرسِل                  |
+| OWNER_EMAIL          | بريد صاحب المستودع                    |
+| FB_PAGE_ACCESS_TOKEN | Facebook Graph API                    |
+| FB_PAGE_ID           | معرّف صفحة فيسبوك                     |
+| IMGBB_API_KEY        | رفع الصور على ImgBB                   |
+| IG_USER_ID           | Instagram User ID                     |
+| PAT_TOKEN            | GitHub Personal Access Token          |
 
 ### أمثلة تطبيقية — ماذا يكتب الوكيل بنفسه
 
-**مثال 1 — إرسال بريد إلكتروني:**
+**مثال 1 — إرسال بريد إلكتروني (استخدم SMTP_PASS وليس SMTP_PASSWORD):**
 ```python
 import smtplib, os
 from email.mime.text import MIMEText
-msg = MIMEText("محتوى الرسالة")
-msg["Subject"] = "تقرير من Selfe Agent"
-msg["From"] = os.environ.get("SMTP_USER", "")
-msg["To"] = "user@example.com"
-with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-    s.login(os.environ.get("SMTP_USER",""), os.environ.get("SMTP_PASSWORD",""))
-    s.send_message(msg)
-print("✅ البريد أُرسل بنجاح")
+smtp_user = os.environ.get("SMTP_USER", "")
+smtp_pass = os.environ.get("SMTP_PASS", "")
+if not smtp_user or not smtp_pass:
+    print("❌ SMTP_USER أو SMTP_PASS غير موجودَين في البيئة")
+else:
+    msg = MIMEText("محتوى الرسالة", "plain", "utf-8")
+    msg["Subject"] = "تقرير من Selfe Agent"
+    msg["From"] = smtp_user
+    msg["To"] = "user@example.com"
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(smtp_user, smtp_pass)
+        s.send_message(msg)
+    print(f"✅ البريد أُرسل بنجاح من {smtp_user}")
 ```
 
 **مثال 2 — النشر على فيسبوك:**
 ```python
 import urllib.request, urllib.parse, os, json
-token   = os.environ.get("FB_ACCESS_TOKEN", "")
+token   = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")
 page_id = os.environ.get("FB_PAGE_ID", "")
-data    = urllib.parse.urlencode({"message": "منشور جديد!", "access_token": token}).encode()
-req     = urllib.request.Request(f"https://graph.facebook.com/v19.0/{page_id}/feed", data=data)
-res     = json.loads(urllib.request.urlopen(req).read())
-print(f"✅ نُشر بنجاح — id: {res.get('id')}")
+if not token or not page_id:
+    print("❌ FB_PAGE_ACCESS_TOKEN أو FB_PAGE_ID غير موجودَين")
+else:
+    data = urllib.parse.urlencode({"message": "منشور جديد!", "access_token": token}).encode()
+    req  = urllib.request.Request(f"https://graph.facebook.com/v19.0/{page_id}/feed", data=data)
+    res  = json.loads(urllib.request.urlopen(req).read())
+    print(f"✅ نُشر بنجاح — id: {res.get('id')}")
 ```
 
-**مثال 3 — إرسال رسالة Telegram:**
-```python
-import urllib.request, urllib.parse, os, json
-token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-params  = urllib.parse.urlencode({"chat_id": chat_id, "text": "رسالة من Selfe Agent 🤖"})
-url     = f"https://api.telegram.org/bot{token}/sendMessage?{params}"
-res     = json.loads(urllib.request.urlopen(url).read())
-print(f"✅ أُرسلت — message_id: {res['result']['message_id']}")
-```
+## ⚠️ قاعدة التحقق من النجاح (إلزامية) — v6.4.0
+
+بعد كل run_script يُرسل بيانات لخدمة خارجية:
+- إذا ظهر "❌" في الـ Observation → المهمة فاشلة، لا تُعلن النجاح، بلّغ المستخدم بالسبب الحقيقي
+- إذا ظهر "متغيرات بيئية مفقودة" → أوضح للمستخدم ما يجب إضافته في GitHub Secrets
+- لا تُعلن النجاح إلا إذا ظهر "✅" مع دليل واضح (بريد مُرسَل من X، message_id، post_id... إلخ)
+- إذا كانت المخرجات فارغة أو مشبوهة → أعد المحاولة أو أبلغ المستخدم
 
 ## قواعد صارمة — لا استثناء
 
 1. **أداة واحدة فقط** في كل رد. لا أداتين معاً أبداً.
-2. **JSON داخل ```json ... ```** دائماً — لا تكتب JSON خارج code fence.
+2. **JSON داخل ```json ... ```** دائماً — لا تكتب JSON خارج code fence أبداً.
 3. **لا تتوقف قبل الإجابة النهائية** — استخدم tool=answer فقط عندما تنتهي من جميع خطوات المهمة.
 4. **إذا فشلت أداة** — انتقل لأداة بديلة أو غيّر المسار، ولا تكرر نفس الخطأ.
 5. **لا تكتب أي نص** قبل JSON أو بعده في نفس الرد.
 6. **استمر في العمل** حتى تُنجز المهمة كاملةً أو تستنفد جميع الأدوات.
 7. **لا تدّعي العجز** — إذا لم تجد أداة مناسبة، اكتب السكريبت بنفسك عبر run_script.
+8. **لا تُعلن النجاح بدون دليل** من الـ Observation يثبت اكتمال المهمة.
 
 ## ⛔ القاعدة الذهبية: لا تصف ما ستفعله — افعله مباشرةً
 
@@ -535,25 +618,16 @@ def is_complex_task(msg: str) -> bool:
 
 
 def parse_tool_call(text: str) -> Optional[dict]:
-    # 1. JSON داخل code fence
+    """
+    v6.4.0: يقبل JSON فقط داخل ```json ... ``` — يرفض JSON خارج code fence
+    لمنع هلوسة الأدوات عند ظهور JSON عشوائي في ردود النموذج.
+    """
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    # 2. JSON مباشر يحتوي على "tool"
-    m = re.search(r"(\{[^{}]*\"tool\"[^{}]*\})", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    # 3. JSON متعدد الأسطر
-    m = re.search(r"(\{[\s\S]*?\"tool\"[\s\S]*?\})", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
+            parsed = json.loads(m.group(1))
+            if "tool" in parsed:
+                return parsed
         except json.JSONDecodeError:
             pass
     return None
@@ -652,8 +726,19 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         code = action.get("code", "")
         if not code.strip():
             return "❌ يجب تحديد code للتنفيذ."
+
+        # v6.4.0: تحقق من المتغيرات قبل التنفيذ
+        service = detect_service_in_code(code)
+        if service:
+            ok, err_msg = check_required_env(service)
+            if not ok:
+                return err_msg
+
         print(f"[ReAct/run_script] تنفيذ سكريبت ({len(code)} حرف)...")
-        return execute_script(code)
+        raw_output = execute_script(code)
+
+        # v6.4.0: التحقق من النتيجة
+        return validate_execution_result(raw_output, action)
 
     elif tool == "answer":
         return action.get("text", "")
@@ -1058,11 +1143,11 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 
 
 # ===================================================================
-# main — v6.3.0
+# main — v6.4.0
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v6.3.0] تشغيل...")
+    print("\n[Selfe Agent CI v6.4.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
