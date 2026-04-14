@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       message:
-        description: 'الرسالة التي تريد إرسالها للنموذج'
+        description: 'الرسالة أو الأمر للوكيل (مثال: مرحباً  أو  @run أرسل بريد)'
         required: true
         default: 'مرحباً، من أنت؟'
       model_index:
@@ -28,66 +28,78 @@ jobs:
       - name: Install dependencies
         run: pip install openai
 
-      - name: Run Selfe Agent (non-interactive)
+      - name: Run Selfe Agent via agent.py
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+          GEMINI_API_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
+          GEMINI_API_KEY_7: ${{ secrets.GEMINI_API_KEY_7 }}
+          GEMINI_API_KEY_8: ${{ secrets.GEMINI_API_KEY_8 }}
+          GEMINI_API_KEY_9: ${{ secrets.GEMINI_API_KEY_9 }}
+          GROQ_API_KEY_1:   ${{ secrets.GROQ_API_KEY_1 }}
+          GROQ_API_KEY_2:   ${{ secrets.GROQ_API_KEY_2 }}
           GROQ_API_KEY:     ${{ secrets.GROQ_API_KEY }}
+          SMTP_USER:        ${{ secrets.SMTP_USER }}
+          SMTP_PASS:        ${{ secrets.SMTP_PASS }}
+          OWNER_EMAIL:      ${{ secrets.OWNER_EMAIL }}
+          IMGBB_API_KEY:    ${{ secrets.IMGBB_API_KEY }}
+          IG_USER_ID:       ${{ secrets.IG_USER_ID }}
+          PAT_TOKEN:        ${{ secrets.PAT_TOKEN }}
           MODEL_INDEX:      ${{ github.event.inputs.model_index }}
           USER_MESSAGE:     ${{ github.event.inputs.message }}
         run: |
           python - <<'EOF'
           import os, sys
 
-          PROVIDER_CONFIG = {
-              "gemini": {
-                  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                  "secret_vars": ["GEMINI_API_KEY_1","GEMINI_API_KEY_2",
-                                  "GEMINI_API_KEY_3","GEMINI_API_KEY_4"],
-              },
-              "groq": {
-                  "base_url": "https://api.groq.com/openai/v1",
-                  "secret_vars": ["GROQ_API_KEY"],
-              },
-          }
+          # ── تحديد النموذج من models.txt ──────────────────────
+          models_file = "models.txt"
+          if not os.path.exists(models_file):
+              print("[ERROR] لم يُعثر على models.txt")
+              sys.exit(1)
 
-          all_keys = {}
-          for p, cfg in PROVIDER_CONFIG.items():
-              all_keys[p] = [os.environ.get(v,"").strip() for v in cfg["secret_vars"] if os.environ.get(v,"").strip()]
-
-          with open("models.txt") as f:
-              models = []
+          models = []
+          with open(models_file, encoding="utf-8") as f:
               for line in f:
                   line = line.strip()
-                  if not line or line.startswith("#"): continue
-                  name, provider = (line.split("|",1) if "|" in line else (line, "gemini"))
+                  if not line or line.startswith("#"):
+                      continue
+                  name, provider = (line.split("|", 1) if "|" in line else (line, "gemini"))
                   models.append({"name": name.strip(), "provider": provider.strip().lower()})
 
-          idx = int(os.environ.get("MODEL_INDEX","1")) - 1
+          idx = int(os.environ.get("MODEL_INDEX", "1")) - 1
           model = models[idx] if idx < len(models) else models[0]
           msg   = os.environ.get("USER_MESSAGE", "مرحباً")
-
-          pkeys = all_keys.get(model["provider"], [])
-          if not pkeys:
-              print(f"[ERROR] لا يوجد مفتاح للمزود: {model['provider']}")
-              sys.exit(1)
 
           print(f"النموذج : {model['name']}")
           print(f"المزود  : {model['provider']}")
           print(f"الرسالة : {msg}\n")
 
-          from openai import OpenAI
-          cfg = PROVIDER_CONFIG[model["provider"]]
-          client = OpenAI(api_key=pkeys[0], base_url=cfg["base_url"])
-          resp = client.chat.completions.create(
-              model=model["name"],
-              messages=[
-                  {"role": "system", "content": "أنت مساعد ذكاء اصطناعي مفيد."},
-                  {"role": "user",   "content": msg},
-              ]
+          # ── تمرير المعطيات إلى agent.py عبر stdin ────────────
+          import subprocess, textwrap
+
+          # نكتب stdin يحاكي اختيار النموذج ثم الرسالة ثم الخروج
+          # السطر الأول: رقم النموذج (select_model يقرأه)
+          # السطر الثاني: الرسالة / الأمر
+          # السطر الثالث: خروج
+          stdin_input = f"{idx + 1}\n{msg}\nخروج\n"
+
+          result = subprocess.run(
+              [sys.executable, "agent.py"],
+              input=stdin_input,
+              capture_output=True,
+              text=True,
+              env=os.environ.copy(),
+              timeout=120,
           )
-          print("رد النموذج:")
-          print(resp.choices[0].message.content)
+
+          print("═" * 60)
+          if result.stdout:
+              print(result.stdout)
+          if result.stderr:
+              print("[STDERR]")
+              print(result.stderr)
+          sys.exit(result.returncode)
           EOF
