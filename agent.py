@@ -6,7 +6,7 @@ import textwrap
 import datetime
 
 # =========================================================
-# Selfe Agent v3.3.0
+# Selfe Agent v3.3.1
 # يدعم مفاتيح متعددة:
 #   GEMINI_API_KEY_1 .. GEMINI_API_KEY_9  → نماذج Gemini
 #   GROQ_API_KEY_1 .. GROQ_API_KEY_2      → نماذج Groq
@@ -28,6 +28,9 @@ import datetime
 #   - رفع السكريبت إلى scripts/ في المستودع
 #   - تسجيل النتائج في reports/run_log.md
 #   - استخدام متغيرات البيئة السرية تلقائياً
+# [v3.3.1] إصلاح generate_script:
+#   - حقن أسماء المتغيرات السرية الحقيقية في البرومبت
+#   - النموذج يعرف الأسماء الصحيحة (SMTP_PASS لا SMTP_PASSWORD)
 # =========================================================
 
 import re
@@ -42,6 +45,18 @@ RUN_LOG_FILE       = os.path.join(REPORTS_DIR, "run_log.md")
 MAX_RETRIES        = 3
 
 DEFAULT_SYSTEM_PROMPT = "أنت مساعد ذكاء اصطناعي مفيد ودقيق."
+
+# ── قائمة المتغيرات السرية المتاحة فعلاً في البيئة ──────────
+# هذه هي الأسماء الحقيقية المضبوطة في GitHub Secrets
+KNOWN_SECRET_VARS = [
+    "SMTP_USER",        # عنوان البريد المُرسِل
+    "SMTP_PASS",        # كلمة مرور التطبيق (App Password)
+    "OWNER_EMAIL",      # بريد صاحب الوكيل
+    "IMGBB_API_KEY",    # مفتاح رفع الصور على ImgBB
+    "IG_USER_ID",       # معرّف حساب Instagram
+    "PAT_TOKEN",        # Personal Access Token لـ GitHub
+    "GROQ_API_KEY",     # مفتاح Groq (القديم للتوافق)
+]
 
 # ── إعدادات المزودين ───────────────────────────────────────
 PROVIDER_CONFIG = {
@@ -148,23 +163,51 @@ def activate_skill(skill_name: str, skills: dict[str, str],
 
 # ─────────────────────────────────────────────────────────────
 # نمط autonomous-agent-patterns — [v3.3.0]
+# إصلاح حقن المتغيرات — [v3.3.1]
 # ─────────────────────────────────────────────────────────────
+
+def build_secrets_context() -> str:
+    """
+    يبني نصاً يشرح للنموذج المتغيرات السرية المتاحة فعلاً،
+    مع وصف دور كل متغير حتى يختار النموذج الصحيح منها.
+    """
+    lines = [
+        "المتغيرات السرية المتاحة فعلاً في بيئة التنفيذ (استخدم os.environ.get بالاسم الصحيح):",
+        "  - SMTP_USER      → عنوان البريد الإلكتروني المُرسِل (مثال: user@gmail.com)",
+        "  - SMTP_PASS      → كلمة مرور التطبيق (App Password) لخادم SMTP",
+        "  - OWNER_EMAIL    → البريد الإلكتروني لصاحب الوكيل (المستلم الافتراضي)",
+        "  - IMGBB_API_KEY  → مفتاح API لرفع الصور على موقع ImgBB",
+        "  - IG_USER_ID     → معرّف حساب Instagram",
+        "  - PAT_TOKEN      → Personal Access Token للتعامل مع GitHub API",
+        "  - GROQ_API_KEY   → مفتاح Groq API (للتوافق مع الإصدارات القديمة)",
+        "",
+        "ملاحظات مهمة:",
+        "  • اسم متغير كلمة المرور هو SMTP_PASS وليس SMTP_PASSWORD",
+        "  • خادم SMTP لـ Gmail: smtp.gmail.com | المنفذ: 587 | الأمان: STARTTLS",
+        "  • استخدم smtplib.SMTP ثم .starttls() ثم .login(user, password)",
+    ]
+    return "\n".join(lines)
+
 
 def generate_script(task_description: str, model_info: dict,
                     all_keys: dict) -> str:
     """
     يطلب من النموذج كتابة سكريبت Python لإنجاز المهمة.
     القواعد المُضمَّنة في البرومبت:
-      1. يستخدم os.environ.get() لقراءة المفاتيح السرية
+      1. يستخدم os.environ.get() بالأسماء الحقيقية للمتغيرات
       2. يطبع النتيجة النهائية في السطر الأخير
       3. يُعيد كود Python نظيفاً بدون markdown
     """
+    secrets_context = build_secrets_context()
+
     prompt = textwrap.dedent(f"""
     أنت مساعد برمجي متخصص في كتابة سكريبتات Python.
     المهمة: {task_description}
 
+    {secrets_context}
+
     اكتب سكريبت Python يُنجز هذه المهمة مع الالتزام بالقواعد التالية:
-    1. استخدم os.environ.get("VARIABLE_NAME") لقراءة أي مفتاح سري أو بيانات حساسة
+    1. استخدم os.environ.get("VARIABLE_NAME") بالأسماء الصحيحة المذكورة أعلاه فقط
     2. اطبع النتيجة النهائية بوضوح في نهاية السكريبت
     3. عالج الأخطاء باستخدام try/except وأظهر رسائل واضحة
     4. لا تضع أي شرح أو markdown — فقط كود Python صالح للتنفيذ مباشرة
@@ -427,7 +470,7 @@ HELP_TEXT = """
 
 def main():
     print("\n╔══════════════════════════════╗")
-    print("║       Selfe Agent v3.3.0     ║")
+    print("║       Selfe Agent v3.3.1     ║")
     print("╚══════════════════════════════╝")
 
     # 1. تحميل المهارات
