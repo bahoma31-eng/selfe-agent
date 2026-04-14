@@ -1,9 +1,12 @@
 import os
 import sys
 import time
+import subprocess
+import textwrap
+import datetime
 
 # =========================================================
-# Selfe Agent v3.2.1
+# Selfe Agent v3.3.0
 # يدعم مفاتيح متعددة:
 #   GEMINI_API_KEY_1 .. GEMINI_API_KEY_9  → نماذج Gemini
 #   GROQ_API_KEY_1 .. GROQ_API_KEY_2      → نماذج Groq
@@ -20,6 +23,11 @@ import time
 #   - Groq:   من مفتاح واحد إلى 2 مفاتيح مع تناوب تلقائي
 # [v3.2.1] إضافة مفتاحَي Gemini الثامن والتاسع:
 #   - GEMINI_API_KEY_8 و GEMINI_API_KEY_9
+# [v3.3.0] تطبيق نمط autonomous-agent-patterns:
+#   - أمر @run: توليد سكريبت Python تلقائياً وتنفيذه
+#   - رفع السكريبت إلى scripts/ في المستودع
+#   - تسجيل النتائج في reports/run_log.md
+#   - استخدام متغيرات البيئة السرية تلقائياً
 # =========================================================
 
 import re
@@ -28,6 +36,9 @@ import urllib.request
 MODELS_FILE        = "models.txt"
 SYSTEM_PROMPT_FILE = "system_prompt.txt"
 SKILLS_FILE        = "skills.txt"
+SCRIPTS_DIR        = "scripts"
+REPORTS_DIR        = "reports"
+RUN_LOG_FILE       = os.path.join(REPORTS_DIR, "run_log.md")
 MAX_RETRIES        = 3
 
 DEFAULT_SYSTEM_PROMPT = "أنت مساعد ذكاء اصطناعي مفيد ودقيق."
@@ -58,15 +69,7 @@ _key_index: dict[str, int] = {p: 0 for p in PROVIDER_CONFIG}
 # ─────────────────────────────────────────────────────────────
 
 def detect_temperature(message: str) -> float:
-    """
-    تحديد قيمة temperature بناءً على نوع الطلب:
-      - طلبات الكود والتصحيح → 0.2  (دقيق، أقل هلوسة)
-      - طلبات حقيقية/تحليلية → 0.5  (توازن دقة/طلاقة)
-      - طلبات إبداعية       → 0.9  (تنوع عالٍ)
-      - عام                 → 0.7  (الافتراضي)
-    """
     msg = message.lower()
-
     code_keywords = [
         "كود", "code", "دالة", "function", "اكتب", "برمجة",
         "خطأ", "debug", "script", "سكريبت", "class", "كلاس",
@@ -82,7 +85,6 @@ def detect_temperature(message: str) -> float:
         "أفكار", "ideas", "إبداع", "creative", "تصميم", "design",
         "تخيّل", "imagine", "قصة", "story",
     ]
-
     if any(k in msg for k in code_keywords):
         return 0.2
     if any(k in msg for k in creative_keywords):
@@ -97,10 +99,6 @@ def detect_temperature(message: str) -> float:
 # ─────────────────────────────────────────────────────────────
 
 def load_skills(filepath: str) -> dict[str, str]:
-    """
-    قراءة skills.txt وإعادة قاموس {skill_name: url}.
-    الصيغة: skill_name | raw_github_url
-    """
     skills: dict[str, str] = {}
     if not os.path.exists(filepath):
         return skills
@@ -116,24 +114,16 @@ def load_skills(filepath: str) -> dict[str, str]:
 
 
 def fetch_skill(url: str) -> str:
-    """
-    جلب محتوى SKILL.md من raw GitHub URL.
-    يستخدم urllib (بدون مكتبات خارجية).
-    """
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "selfe-agent/3.2"})
+        req = urllib.request.Request(url, headers={"User-Agent": "selfe-agent/3.3"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.read().decode("utf-8")
-    except Exception as e:
+    except Exception:
         return ""
 
 
 def activate_skill(skill_name: str, skills: dict[str, str],
                    history: list[dict]) -> tuple[str, list[dict]]:
-    """
-    تفعيل مهارة — جلب SKILL.md وضبطه كـ system message.
-    تُعيد تاريخ المحادثة مع البرومبت الجديد.
-    """
     key = skill_name.lower().strip()
     if key not in skills:
         available = ", ".join(skills.keys()) or "لا يوجد"
@@ -142,14 +132,11 @@ def activate_skill(skill_name: str, skills: dict[str, str],
             f"المهارات المتاحة: {available}",
             history
         )
-
     url = skills[key]
     print(f"[جلب] جاري جلب SKILL.md من:\n  {url}")
     content = fetch_skill(url)
-
     if not content:
         return f"[خطأ] تعذّر جلب المهارة من الرابط.\nتحقّق من صحة الرابط في skills.txt", history
-
     new_history = [{"role": "system", "content": content}]
     msg = (
         f"[تم] تفعيل المهارة \033[1m{key}\033[0m ✔\n"
@@ -157,6 +144,133 @@ def activate_skill(skill_name: str, skills: dict[str, str],
         f"  المحادثة السابقة أُعيدت تحضيرها بالسياق الجديد."
     )
     return msg, new_history
+
+
+# ─────────────────────────────────────────────────────────────
+# نمط autonomous-agent-patterns — [v3.3.0]
+# ─────────────────────────────────────────────────────────────
+
+def generate_script(task_description: str, model_info: dict,
+                    all_keys: dict) -> str:
+    """
+    يطلب من النموذج كتابة سكريبت Python لإنجاز المهمة.
+    القواعد المُضمَّنة في البرومبت:
+      1. يستخدم os.environ.get() لقراءة المفاتيح السرية
+      2. يطبع النتيجة النهائية في السطر الأخير
+      3. يُعيد كود Python نظيفاً بدون markdown
+    """
+    prompt = textwrap.dedent(f"""
+    أنت مساعد برمجي متخصص في كتابة سكريبتات Python.
+    المهمة: {task_description}
+
+    اكتب سكريبت Python يُنجز هذه المهمة مع الالتزام بالقواعد التالية:
+    1. استخدم os.environ.get("VARIABLE_NAME") لقراءة أي مفتاح سري أو بيانات حساسة
+    2. اطبع النتيجة النهائية بوضوح في نهاية السكريبت
+    3. عالج الأخطاء باستخدام try/except وأظهر رسائل واضحة
+    4. لا تضع أي شرح أو markdown — فقط كود Python صالح للتنفيذ مباشرة
+    5. أضف تعليقاً في السطر الأول: # Task: {task_description[:60]}
+    """).strip()
+
+    history_tmp = [{"role": "system", "content": prompt}]
+    raw = chat(model_info, all_keys, task_description, history_tmp)
+
+    # استخراج الكود إذا جاء ضمن ```python ... ```
+    code_match = re.search(r"```(?:python)?\n(.*?)```", raw, re.DOTALL)
+    return code_match.group(1).strip() if code_match else raw.strip()
+
+
+def save_script(script_code: str, task_name: str) -> str:
+    """حفظ السكريبت في scripts/ وإعادة مساره."""
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r"[^\w]", "_", task_name[:40]).lower()
+    filename = f"{safe_name}_{timestamp}.py"
+    filepath = os.path.join(SCRIPTS_DIR, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(script_code)
+    return filepath
+
+
+def run_script(filepath: str) -> tuple[str, str, int]:
+    """تنفيذ السكريبت وإعادة (stdout, stderr, returncode)."""
+    try:
+        result = subprocess.run(
+            [sys.executable, filepath],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=os.environ.copy(),
+        )
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "[خطأ] انتهت مهلة التنفيذ (60 ثانية).", 1
+    except Exception as e:
+        return "", f"[خطأ] فشل التنفيذ: {e}", 1
+
+
+def log_run(task: str, script_path: str,
+            stdout: str, stderr: str, returncode: int) -> None:
+    """تسجيل نتيجة التنفيذ في reports/run_log.md."""
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status = "✅ نجح" if returncode == 0 else "❌ فشل"
+    entry = textwrap.dedent(f"""
+    ---
+    ## {now} — {status}
+    **المهمة:** {task}
+    **السكريبت:** `{script_path}`
+    **كود الخروج:** `{returncode}`
+
+    ### المخرجات
+    ```
+    {stdout.strip() or '(لا مخرجات)'}
+    ```
+
+    ### الأخطاء
+    ```
+    {stderr.strip() or '(لا أخطاء)'}
+    ```
+    """).strip() + "\n"
+
+    mode = "a" if os.path.exists(RUN_LOG_FILE) else "w"
+    with open(RUN_LOG_FILE, mode, encoding="utf-8") as f:
+        if mode == "w":
+            f.write("# سجل تشغيل السكريبتات — Selfe Agent\n\n")
+        f.write(entry + "\n")
+
+
+def handle_run_command(task: str, model_info: dict, all_keys: dict) -> str:
+    """
+    تنفيذ نمط autonomous-agent-patterns:
+      1. توليد السكريبت بالذكاء الاصطناعي
+      2. حفظه في scripts/
+      3. تنفيذه
+      4. تسجيل النتيجة في reports/run_log.md
+      5. إعادة تقرير موجز للمستخدم
+    """
+    print(f"\n[🤖 @run] جاري توليد السكريبت للمهمة: {task}")
+    script_code = generate_script(task, model_info, all_keys)
+
+    script_path = save_script(script_code, task)
+    print(f"[💾] السكريبت محفوظ: {script_path}")
+    print(f"[▶️ ] جاري التنفيذ...")
+
+    stdout, stderr, rc = run_script(script_path)
+    log_run(task, script_path, stdout, stderr, rc)
+
+    status = "✅ نجح" if rc == 0 else "❌ فشل"
+    report = (
+        f"\n{'='*50}\n"
+        f"[{status}] نتيجة تنفيذ: {task}\n"
+        f"السكريبت: {script_path}\n"
+        f"{'='*50}\n"
+    )
+    if stdout.strip():
+        report += f"📤 المخرجات:\n{stdout.strip()}\n"
+    if stderr.strip():
+        report += f"⚠️  الأخطاء:\n{stderr.strip()}\n"
+    report += f"\n📋 التقرير الكامل محفوظ في: {RUN_LOG_FILE}"
+    return report
 
 
 # ─────────────────────────────────────────────────────────────
@@ -246,12 +360,6 @@ def select_model(models: list[dict]) -> dict:
 
 def chat(model_info: dict, all_keys: dict,
          user_message: str, history: list[dict]) -> str:
-    """
-    إرسال رسالة للنموذج مع:
-      - temperature ديناميكية حسب نوع الطلب  [v3.1.0]
-      - max_tokens=4096 لمنع قطع الردود      [v3.1.0]
-      - retry مع Exponential Backoff         [v3.1.0]
-    """
     try:
         from openai import OpenAI, RateLimitError, AuthenticationError
     except ImportError:
@@ -281,7 +389,7 @@ def chat(model_info: dict, all_keys: dict,
             except RateLimitError:
                 print("[تحذير] Rate limit — تحويل المفتاح...")
                 rotate_key(provider)
-                break  # جرّب المفتاح التالي فوراً
+                break
 
             except AuthenticationError:
                 print("[خطأ] مفتاح غير صالح — تحويل...")
@@ -290,7 +398,7 @@ def chat(model_info: dict, all_keys: dict,
 
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
-                    wait = 2 ** attempt  # 1s، 2s، 4s
+                    wait = 2 ** attempt
                     print(f"[تحذير] خطأ مؤقت، إعادة المحاولة "
                           f"{attempt + 1}/{MAX_RETRIES} بعد {wait}s...")
                     time.sleep(wait)
@@ -309,6 +417,7 @@ HELP_TEXT = """
   @skill <اسم>          — تفعيل مهارة (تجلب SKILL.md وتضبطه كبرومبت)
   @skill <اسم> <رسالة>  — تفعيل المهارة وإرسال رسالة فوراً
   @skills              — عرض المهارات المتاحة
+  @run <وصف المهمة>    — توليد سكريبت Python وتنفيذه تلقائياً
   جديد / new          — بدء محادثة جديدة
   تحديث / reload       — إعادة تحميل البرومبت من الملف
   خروج / exit          — إنهاء البرنامج
@@ -318,7 +427,7 @@ HELP_TEXT = """
 
 def main():
     print("\n╔══════════════════════════════╗")
-    print("║       Selfe Agent v3.2.1     ║")
+    print("║       Selfe Agent v3.3.0     ║")
     print("╚══════════════════════════════╝")
 
     # 1. تحميل المهارات
@@ -390,6 +499,19 @@ def main():
             else:
                 print("لا توجد مهارات. أضف مهارات في skills.txt")
             print()
+            continue
+
+        # ── أمر @run — autonomous-agent-patterns [v3.3.0] ──
+        if low.startswith("@run "):
+            task = user_input[len("@run "):].strip()
+            if not task:
+                print("[خطأ] أدخل وصف المهمة بعد @run\n")
+                continue
+            result = handle_run_command(task, model_info, all_keys)
+            print(result)
+            print()
+            history.append({"role": "user", "content": user_input})
+            history.append({"role": "assistant", "content": result})
             continue
 
         # ── أمر @skill ───────────────────────────────────
