@@ -1,5 +1,5 @@
 # =============================================================
-# agent_ci.py — Selfe Agent v6.2.0
+# agent_ci.py — Selfe Agent v6.3.0
 # إصلاح شامل: فصل طبقات الفشل + Retry ذكي + ReAct محسّن
 # v6.1.1: إصلاح TypeError عند raw=None (choices[0].message.content)
 # v6.1.0: 3 حلول لاستنزاف حصة API:
@@ -8,6 +8,9 @@
 #   3. وضع Fallback: Groq كامل عند فشل Gemini بالكامل
 # v6.2.0: تحسين REACT_SYSTEM_PROMPT بقاعدة "لا تصف — افعل"
 #         + تحسين رسالة الخطأ في react_loop عند غياب الأداة
+# v6.3.0: مبدأ الاكتفاء الذاتي — الوكيل يكتب سكريبتاته بنفسه
+#         ويستعمل المفاتيح السرية من GitHub Secrets مباشرةً
+#         دون الحاجة لأدوات مُعرَّفة مسبقاً (إرسال بريد، نشر فيسبوك...)
 # =============================================================
 
 import os
@@ -165,7 +168,7 @@ class ErrorMonitor:
 
 
 # ===================================================================
-# SmartAPIClient — v6.2.0
+# SmartAPIClient — v6.3.0
 # ===================================================================
 
 class SmartAPIClient:
@@ -344,7 +347,7 @@ def _github_request(method: str, path: str, data: dict = None) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "selfe-agent/6.2.0",
+        "User-Agent": "selfe-agent/6.3.0",
     }
     body = json.dumps(data).encode() if data else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -384,7 +387,7 @@ def read_file_from_github(owner, repo, filepath, branch="main"):
 
 
 # ===================================================================
-# ReAct Loop — v6.2.0
+# ReAct Loop — v6.3.0
 # ===================================================================
 
 REACT_SYSTEM_PROMPT = """\
@@ -392,13 +395,14 @@ REACT_SYSTEM_PROMPT = """\
 
 ## الأدوات المتاحة
 
-| الأداة       | الوصف                                 |
-|-------------|---------------------------------------|
-| read_file   | قراءة محتوى ملف من GitHub             |
-| push_file   | رفع/تعديل ملف في GitHub               |
-| list_files  | عرض الملفات والمجلدات                 |
-| search_files| البحث عن ملف بالاسم في المستودع       |
-| answer      | إرجاع الرد النهائي للمستخدم           |
+| الأداة         | الوصف                                                    |
+|---------------|----------------------------------------------------------|
+| read_file     | قراءة محتوى ملف من GitHub                                |
+| push_file     | رفع/تعديل ملف في GitHub                                  |
+| list_files    | عرض الملفات والمجلدات                                    |
+| search_files  | البحث عن ملف بالاسم في المستودع                          |
+| run_script    | كتابة وتنفيذ سكريبت Python مباشرةً داخل بيئة التشغيل    |
+| answer        | إرجاع الرد النهائي للمستخدم                              |
 
 ## صيغة الاستخدام (إلزامية)
 
@@ -421,7 +425,78 @@ REACT_SYSTEM_PROMPT = """\
 ```
 
 ```json
+{"tool": "run_script", "code": "import os\nprint(os.environ.get('GITHUB_TOKEN',''))"}
+```
+
+```json
 {"tool": "answer", "text": "ردك النهائي هنا"}
+```
+
+## مبدأ الاكتفاء الذاتي — القاعدة الأساسية الجديدة
+
+إذا طُلب منك تنفيذ عملية لا تملك أداةً مُعرَّفة لها مسبقاً
+(مثل: إرسال بريد إلكتروني، النشر على فيسبوك، إرسال رسالة Telegram،
+استدعاء API خارجي، إرسال SMS، جدولة مهمة...)
+
+**لا تقل أنك عاجز. بل:**
+
+1. **اكتب سكريبت Python** يُنجز المهمة كاملاً
+2. **استعمل المفاتيح السرية** المتاحة في بيئة GitHub Actions
+   عبر: `os.environ.get("VARIABLE_NAME", "")`
+3. **استخدم أداة run_script** لتنفيذ السكريبت فوراً
+4. **ارفع السكريبت** كملف في المستودع لإعادة استخدامه لاحقاً
+5. **سجّل النتيجة** في تقرير أو تعليق على الـ Issue
+
+### المفاتيح السرية المتاحة دائماً في بيئة التشغيل
+
+| المفتاح               | الاستخدام                              |
+|----------------------|----------------------------------------|
+| GITHUB_TOKEN         | GitHub API — متاح دائماً              |
+| GEMINI_API_KEY_1..4  | نماذج Gemini                           |
+| GROQ_API_KEY         | نماذج Groq / LLaMA                    |
+| SMTP_PASSWORD        | إرسال البريد الإلكتروني (إن وُجد)     |
+| SMTP_USER            | حساب البريد المُرسِل (إن وُجد)        |
+| FB_ACCESS_TOKEN      | Facebook Graph API (إن وُجد)           |
+| TELEGRAM_BOT_TOKEN   | Telegram Bot API (إن وُجد)             |
+| TWILIO_AUTH_TOKEN    | Twilio SMS/WhatsApp (إن وُجد)          |
+| TWILIO_ACCOUNT_SID   | Twilio Account SID (إن وُجد)           |
+
+### أمثلة تطبيقية — ماذا يكتب الوكيل بنفسه
+
+**مثال 1 — إرسال بريد إلكتروني:**
+```python
+import smtplib, os
+from email.mime.text import MIMEText
+msg = MIMEText("محتوى الرسالة")
+msg["Subject"] = "تقرير من Selfe Agent"
+msg["From"] = os.environ.get("SMTP_USER", "")
+msg["To"] = "user@example.com"
+with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+    s.login(os.environ.get("SMTP_USER",""), os.environ.get("SMTP_PASSWORD",""))
+    s.send_message(msg)
+print("✅ البريد أُرسل بنجاح")
+```
+
+**مثال 2 — النشر على فيسبوك:**
+```python
+import urllib.request, urllib.parse, os, json
+token   = os.environ.get("FB_ACCESS_TOKEN", "")
+page_id = os.environ.get("FB_PAGE_ID", "")
+data    = urllib.parse.urlencode({"message": "منشور جديد!", "access_token": token}).encode()
+req     = urllib.request.Request(f"https://graph.facebook.com/v19.0/{page_id}/feed", data=data)
+res     = json.loads(urllib.request.urlopen(req).read())
+print(f"✅ نُشر بنجاح — id: {res.get('id')}")
+```
+
+**مثال 3 — إرسال رسالة Telegram:**
+```python
+import urllib.request, urllib.parse, os, json
+token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+params  = urllib.parse.urlencode({"chat_id": chat_id, "text": "رسالة من Selfe Agent 🤖"})
+url     = f"https://api.telegram.org/bot{token}/sendMessage?{params}"
+res     = json.loads(urllib.request.urlopen(url).read())
+print(f"✅ أُرسلت — message_id: {res['result']['message_id']}")
 ```
 
 ## قواعد صارمة — لا استثناء
@@ -432,12 +507,14 @@ REACT_SYSTEM_PROMPT = """\
 4. **إذا فشلت أداة** — انتقل لأداة بديلة أو غيّر المسار، ولا تكرر نفس الخطأ.
 5. **لا تكتب أي نص** قبل JSON أو بعده في نفس الرد.
 6. **استمر في العمل** حتى تُنجز المهمة كاملةً أو تستنفد جميع الأدوات.
+7. **لا تدّعي العجز** — إذا لم تجد أداة مناسبة، اكتب السكريبت بنفسك عبر run_script.
 
 ## ⛔ القاعدة الذهبية: لا تصف ما ستفعله — افعله مباشرةً
 
 الخطأ الشائع (محظور تماماً):
   "سأقوم أولاً بـ X ثم Y، هل توافق؟"
   "سأنفذ الخطوات التالية: 1. ... 2. ..."
+  "لا أستطيع إرسال البريد لأنني لا أملك الأداة..."
 
 الصحيح: ابدأ فوراً بأداة JSON دون مقدمات.
 """
@@ -480,6 +557,36 @@ def parse_tool_call(text: str) -> Optional[dict]:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def execute_script(code: str) -> str:
+    """تنفيذ سكريبت Python مباشرةً مع وراثة متغيرات البيئة الكاملة."""
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+        f.write(code)
+        tmp_path = f.name
+    try:
+        result = subprocess.run(
+            [sys.executable, tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=os.environ.copy(),
+        )
+        output = result.stdout.strip()
+        errors = result.stderr.strip()
+        if result.returncode == 0:
+            return f"✅ نتيجة التنفيذ:\n{output}" if output else "✅ تم التنفيذ بنجاح (لا مخرجات)."
+        return f"❌ خطأ في التنفيذ (code={result.returncode}):\n{errors}\n{output}"
+    except subprocess.TimeoutExpired:
+        return "❌ انتهت مهلة التنفيذ (60 ثانية)."
+    except Exception as e:
+        return f"❌ خطأ غير متوقع أثناء تشغيل السكريبت: {e}"
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 def execute_tool(action: dict, owner: str, repo: str) -> str:
@@ -541,11 +648,21 @@ def execute_tool(action: dict, owner: str, repo: str) -> str:
         except Exception as e:
             return f"❌ خطأ search_files: {e}"
 
+    elif tool == "run_script":
+        code = action.get("code", "")
+        if not code.strip():
+            return "❌ يجب تحديد code للتنفيذ."
+        print(f"[ReAct/run_script] تنفيذ سكريبت ({len(code)} حرف)...")
+        return execute_script(code)
+
     elif tool == "answer":
         return action.get("text", "")
 
     else:
-        return f"⚠️ أداة غير معروفة: `{tool}`. الأدوات المتاحة: read_file, push_file, list_files, search_files, answer"
+        return (
+            f"⚠️ أداة غير معروفة: `{tool}`. "
+            f"الأدوات المتاحة: read_file, push_file, list_files, search_files, run_script, answer"
+        )
 
 
 def react_loop(
@@ -609,6 +726,8 @@ def react_loop(
                 "role": "user",
                 "content": (
                     "⛔ **خطأ: لم أتلقَّ أداة بالصيغة المطلوبة.**\n\n"
+                    "**تذكير بمبدأ الاكتفاء الذاتي:** إذا لم تجد أداةً مُعرَّفة لمهمتك، "
+                    "اكتب سكريبت Python بنفسك وشغّله عبر run_script.\n\n"
                     "**القاعدة الذهبية:** لا تصف ما ستفعله — افعله مباشرةً.\n"
                     "❌ خاطئ: \"سأقوم أولاً بقراءة الملف ثم...\"\n"
                     "✅ صحيح: ابدأ فوراً بـ JSON:\n"
@@ -644,8 +763,8 @@ def react_loop(
                         f"Observation: {observation}\n\n"
                         f"🚫 فشلت أداة `{tool_name}` {fail_count} مرات متتالية. "
                         f"لا تُعيد استخدامها. "
-                        f"انتقل إلى مسار بديل (مثلاً: list_files للتحقق من المسار، "
-                        f"أو search_files للعثور على الملف)، "
+                        f"تذكّر مبدأ الاكتفاء الذاتي: إذا فشلت الأداة المُعرَّفة، "
+                        f"اكتب سكريبت Python بنفسك عبر run_script لتنفيذ المهمة مباشرةً، "
                         f"أو استخدم tool=answer مع شرح ما تعذّر إنجازه."
                     )
                 })
@@ -939,11 +1058,11 @@ PUSH_SYSTEM_PROMPT = """أنت Selfe، وكيل برمجة.
 
 
 # ===================================================================
-# main — v6.2.0
+# main — v6.3.0
 # ===================================================================
 
 def main():
-    print("\n[Selfe Agent CI v6.2.0] تشغيل...")
+    print("\n[Selfe Agent CI v6.3.0] تشغيل...")
 
     msg = os.environ.get("USER_MESSAGE", "").strip()
     if not msg:
