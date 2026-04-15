@@ -26,7 +26,7 @@ def send_email(sender_email, sender_password, receiver_email, subject, body):
         print("✅ تم إرسال البريد الإلكتروني بنجاح!")
 
     except smtplib.SMTPAuthenticationError:
-        print("❌ خطأ في المصادقة: تحقق من SENDER_EMAIL و SENDER_APP_PASSWORD.")
+        print("❌ خطأ في المصادقة: تحقق من SMTP_USER و SMTP_PASS.")
         raise
     except Exception as e:
         print(f"❌ خطأ: {e}")
@@ -38,11 +38,11 @@ def send_email(sender_email, sender_password, receiver_email, subject, body):
             pass
 
 if __name__ == "__main__":
-    SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-    SENDER_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
+    SENDER_EMAIL = os.getenv("SMTP_USER")
+    SENDER_PASSWORD = os.getenv("SMTP_PASS")
 
     if not SENDER_EMAIL or not SENDER_PASSWORD:
-        print("❌ خطأ: متغيرات البيئة SENDER_EMAIL أو SENDER_APP_PASSWORD غير موجودة.")
+        print("❌ خطأ: متغيرات البيئة SMTP_USER أو SMTP_PASS غير موجودة.")
         exit(1)
 
     RECEIVER_EMAIL = "bahoma31@gmail.com"
