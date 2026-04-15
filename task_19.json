@@ -1,0 +1,48 @@
+{
+  "issue_number": 19,
+  "summary": "Send an email to bahoma31@gmail.com informing them that everything is fine and development is ongoing with the new agent",
+  "task_type": "email",
+  "required_secrets": [
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS"
+  ],
+  "missing_secrets": [
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS"
+  ],
+  "phases": [
+    {
+      "phase": 1,
+      "title": "Import necessary libraries",
+      "description": "Import smtplib library to send email",
+      "tool": "python_code",
+      "expected_output": "No output, just successful import"
+    },
+    {
+      "phase": 2,
+      "title": "Define email parameters",
+      "description": "Define sender, receiver, subject, and body of the email",
+      "tool": "python_code",
+      "expected_output": "Email parameters defined"
+    },
+    {
+      "phase": 3,
+      "title": "Establish SMTP connection",
+      "description": "Use SMTP_HOST, SMTP_PORT, SMTP_USER, and SMTP_PASS to establish a connection",
+      "tool": "python_code",
+      "expected_output": "Successful connection to SMTP server"
+    },
+    {
+      "phase": 4,
+      "title": "Send email",
+      "description": "Use smtplib to send the email to bahoma31@gmail.com",
+      "tool": "python_code",
+      "expected_output": "Email sent successfully"
+    }
+  ],
+  "success_criteria": "Email is delivered to bahoma31@gmail.com with the correct content"
+}
