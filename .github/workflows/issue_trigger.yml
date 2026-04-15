@@ -27,9 +27,60 @@ jobs:
       - name: Install dependencies
         run: pip install groq requests
 
+      # ── إنشاء secrets_map.json تلقائياً إذا لم يكن موجوداً ──────
+      - name: Ensure secrets_map.json exists
+        run: |
+          if [ ! -f secrets_map.json ]; then
+            echo 'Creating default secrets_map.json...'
+            cat > secrets_map.json << 'EOF'
+          {
+            "_comment": "Add any new secret name here to pass it automatically to the agent. Do NOT put secret values here.",
+            "secrets": [
+              "GROQ_API_KEY",
+              "SMTP_HOST",
+              "SMTP_PORT",
+              "SMTP_USER",
+              "SMTP_PASS",
+              "SMTP_PASSWORD",
+              "NOTION_TOKEN",
+              "OPENAI_API_KEY",
+              "ANTHROPIC_API_KEY",
+              "PAT_TOKEN",
+              "GITHUB_PAT",
+              "TELEGRAM_BOT_TOKEN",
+              "TELEGRAM_CHAT_ID",
+              "DISCORD_WEBHOOK_URL",
+              "SLACK_WEBHOOK_URL",
+              "TWILIO_ACCOUNT_SID",
+              "TWILIO_AUTH_TOKEN",
+              "AWS_ACCESS_KEY_ID",
+              "AWS_SECRET_ACCESS_KEY",
+              "AWS_REGION",
+              "GOOGLE_API_KEY",
+              "FIREBASE_API_KEY",
+              "SUPABASE_URL",
+              "SUPABASE_KEY",
+              "DATABASE_URL",
+              "MONGODB_URI",
+              "STRIPE_SECRET_KEY",
+              "PAYPAL_CLIENT_ID",
+              "PAYPAL_CLIENT_SECRET",
+              "API_KEY",
+              "SECRET_KEY",
+              "WEBHOOK_URL"
+            ]
+          }
+          EOF
+            git config user.name "Agent Bot"
+            git config user.email "agent@bot.com"
+            git add secrets_map.json
+            git commit -m "chore: add default secrets_map.json"
+            git push
+          else
+            echo 'secrets_map.json already exists.'
+          fi
+
       # ── كتابة الـ secrets في agent_secrets.env من secrets_map.json ──
-      # الفكرة: secrets_map.json يحتوي على أسماء الـ secrets فقط
-      # الـ workflow يُمرر قيمها عبر env ثم يكتبها في الملف
       - name: Write secrets to agent_secrets.env
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -64,8 +115,8 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
           SECRET_KEY: ${{ secrets.SECRET_KEY }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          GITHUB_TOKEN_SECRET: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # قراءة أسماء الـ secrets من secrets_map.json وكتابة القيم المتاحة
           python3 - << 'PYEOF'
           import json, os
 
@@ -73,17 +124,22 @@ jobs:
               data = json.load(f)
 
           secret_names = data.get("secrets", [])
-          # إضافة GITHUB_TOKEN دائماً
-          if "GITHUB_TOKEN" not in secret_names:
-              secret_names.insert(0, "GITHUB_TOKEN")
 
+          # إضافة GITHUB_TOKEN دائماً
+          env_token = os.environ.get("GITHUB_TOKEN_SECRET", "")
           available = []
           lines = []
+
           for name in secret_names:
               val = os.environ.get(name, "")
               lines.append(f"{name}={val}")
               if val:
                   available.append(name)
+
+          # إضافة GITHUB_TOKEN
+          lines.append(f"GITHUB_TOKEN={env_token}")
+          if env_token:
+              available.append("GITHUB_TOKEN")
 
           with open("agent_secrets.env", "w") as f:
               f.write("\n".join(lines) + "\n")
@@ -91,14 +147,9 @@ jobs:
           with open("available_secrets.txt", "w") as f:
               f.write("\n".join(available) + "\n")
 
-          print(f"✅ agent_secrets.env written with {len(secret_names)} entries")
+          print(f"✅ agent_secrets.env written with {len(lines)} entries")
           print(f"📋 Available secrets ({len(available)}): {available}")
           PYEOF
-
-          # إضافة GITHUB_TOKEN يدوياً (متاح دائماً من GitHub)
-          echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> agent_secrets.env
-          grep -v '^$' available_secrets.txt > /tmp/avail.txt && mv /tmp/avail.txt available_secrets.txt || true
-          echo "GITHUB_TOKEN" >> available_secrets.txt
 
       # ── تشغيل Planner Agent ───────────────────────────────────────
       - name: Run Planner Agent
