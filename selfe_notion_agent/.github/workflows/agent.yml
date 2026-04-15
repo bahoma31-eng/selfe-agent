@@ -1,0 +1,79 @@
+name: Autonomous Task Agent
+
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  planner:
+    runs-on: ubuntu-latest
+    outputs:
+      plan_created: ${{ steps.planner.outputs.plan_created }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install groq
+      
+      - name: Run Planner Agent
+        id: planner
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          python agents/planner.py
+          echo "plan_created=true" >> $GITHUB_OUTPUT
+      
+      - name: Commit plan_task.md
+        run: |
+          git config user.name "Agent Bot"
+          git config user.email "agent@bot.com"
+          git add plan_task.md
+          git commit -m "plan: Issue #${{ github.event.issue.number }}"
+          git push
+
+  executor:
+    needs: planner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Pull latest (plan_task.md)
+        run: git pull
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run Executor Agent
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: python agents/executor.py
+      
+      - name: Commit outputs and updated plan
+        run: |
+          git config user.name "Agent Bot"
+          git config user.email "agent@bot.com"
+          git add plan_task.md output/
+          git commit -m "done: Issue #${{ github.event.issue.number }} all phases completed"
+          git push
+      
+      - name: Close Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed'
+            })
