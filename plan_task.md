@@ -24,4 +24,4 @@ email
 - [ ] Phase 3: Send email using SMTP - Use smtplib to send the email to bahoma31@gmail.com
 
 ## Success Criteria
-Email is delivered to bahoma31@gmail.com with the correct content
+The email is delivered to bahoma31@gmail.com with the correct content
