@@ -1,0 +1,27 @@
+{
+  "issue_number": 20,
+  "summary": "Send an email to bahoma31@gmail.com stating that everything is alright",
+  "task_type": "email",
+  "required_secrets": [
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS"
+  ],
+  "missing_secrets": [
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS"
+  ],
+  "phases": [
+    {
+      "phase": 1,
+      "title": "Send Email",
+      "description": "Use smtplib to send an email to bahoma31@gmail.com with the message 'كل شيء على ما يرام'",
+      "tool": "python_code",
+      "expected_output": "Email sent successfully"
+    }
+  ],
+  "success_criteria": "The email is delivered to bahoma31@gmail.com with the correct message"
+}
