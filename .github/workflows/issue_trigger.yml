@@ -27,19 +27,81 @@ jobs:
       - name: Install dependencies
         run: pip install groq requests
 
-      # ── استخراج رقم الـ Issue ──────────────────────────────────
-      - name: Extract Issue Number
-        id: issue_info
+      # ── كتابة الـ secrets في agent_secrets.env من secrets_map.json ──
+      # الفكرة: secrets_map.json يحتوي على أسماء الـ secrets فقط
+      # الـ workflow يُمرر قيمها عبر env ثم يكتبها في الملف
+      - name: Write secrets to agent_secrets.env
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
+          PAYPAL_CLIENT_SECRET: ${{ secrets.PAYPAL_CLIENT_SECRET }}
+          API_KEY: ${{ secrets.API_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          if [ "${{ github.event_name }}" = "issues" ]; then
-            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
-          fi
+          # قراءة أسماء الـ secrets من secrets_map.json وكتابة القيم المتاحة
+          python3 - << 'PYEOF'
+          import json, os
 
-      # ── تشغيل Planner Agent ───────────────────────────────────
+          with open("secrets_map.json") as f:
+              data = json.load(f)
+
+          secret_names = data.get("secrets", [])
+          # إضافة GITHUB_TOKEN دائماً
+          if "GITHUB_TOKEN" not in secret_names:
+              secret_names.insert(0, "GITHUB_TOKEN")
+
+          available = []
+          lines = []
+          for name in secret_names:
+              val = os.environ.get(name, "")
+              lines.append(f"{name}={val}")
+              if val:
+                  available.append(name)
+
+          with open("agent_secrets.env", "w") as f:
+              f.write("\n".join(lines) + "\n")
+
+          with open("available_secrets.txt", "w") as f:
+              f.write("\n".join(available) + "\n")
+
+          print(f"✅ agent_secrets.env written with {len(secret_names)} entries")
+          print(f"📋 Available secrets ({len(available)}): {available}")
+          PYEOF
+
+          # إضافة GITHUB_TOKEN يدوياً (متاح دائماً من GitHub)
+          echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> agent_secrets.env
+          grep -v '^$' available_secrets.txt > /tmp/avail.txt && mv /tmp/avail.txt available_secrets.txt || true
+          echo "GITHUB_TOKEN" >> available_secrets.txt
+
+      # ── تشغيل Planner Agent ───────────────────────────────────────
       - name: Run Planner Agent
-        id: planner
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
@@ -47,36 +109,41 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          AVAILABLE_SECRETS_FILE: available_secrets.txt
         run: python selfe_notion_agent/agents/planner.py
 
-      # ── حفظ plan_task.md في الـ repo ─────────────────────────
+      # ── حفظ plan_task.md ──────────────────────────────────────────
       - name: Commit plan_task.md
         run: |
           git config user.name "Agent Bot"
           git config user.email "agent@bot.com"
-          git add plan_task.md
+          git add plan_task.md task_*.json || true
           git diff --staged --quiet || git commit -m "plan: Issue #${{ github.event.issue.number }}"
           git push
 
-      # ── تشغيل Executor Agent ──────────────────────────────────
+      # ── تشغيل Executor Agent ──────────────────────────────────────
       - name: Run Executor Agent
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          SECRETS_ENV_FILE: agent_secrets.env
+          AVAILABLE_SECRETS_FILE: available_secrets.txt
         run: python selfe_notion_agent/agents/executor.py
 
-      # ── حفظ المخرجات ─────────────────────────────────────────
+      # ── حفظ المخرجات ──────────────────────────────────────────────
       - name: Commit outputs and updated plan
         run: |
           git config user.name "Agent Bot"
           git config user.email "agent@bot.com"
-          git add plan_task.md selfe_notion_agent/output/
+          git add plan_task.md task_*.json output/ || true
           git diff --staged --quiet || git commit -m "done: Issue #${{ github.event.issue.number }} all phases completed"
           git push
 
-      # ── إغلاق الـ Issue تلقائياً ─────────────────────────────
+      # ── إغلاق الـ Issue ───────────────────────────────────────────
       - name: Close Issue
         uses: actions/github-script@v7
         with:
