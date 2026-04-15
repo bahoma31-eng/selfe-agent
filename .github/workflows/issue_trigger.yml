@@ -25,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install groq
+        run: pip install groq requests
 
       # ── استخراج رقم الـ Issue ──────────────────────────────────
       - name: Extract Issue Number
@@ -41,11 +41,11 @@ jobs:
       - name: Run Planner Agent
         id: planner
         env:
-          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
-          ISSUE_NUMBER:      ${{ github.event.issue.number }}
-          ISSUE_TITLE:       ${{ github.event.issue.title }}
-          ISSUE_BODY:        ${{ github.event.issue.body }}
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python selfe_notion_agent/agents/planner.py
 
@@ -61,8 +61,10 @@ jobs:
       # ── تشغيل Executor Agent ──────────────────────────────────
       - name: Run Executor Agent
         env:
-          GROQ_API_KEY:  ${{ secrets.GROQ_API_KEY }}
-          ISSUE_NUMBER:  ${{ github.event.issue.number }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python selfe_notion_agent/agents/executor.py
 
       # ── حفظ المخرجات ─────────────────────────────────────────
@@ -79,15 +81,9 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              issue_number: context.issue.number,
-              body: `✅ **Planner Agent:** تم إنشاء خطة التنفيذ وإتمام جميع المراحل!\n\n---\n*Triggered automatically by [Selfe Notion Agent](https://github.com/bahoma31-eng/selfe-agent)*`
-            });
             await github.rest.issues.update({
               owner: context.repo.owner,
-              repo:  context.repo.repo,
+              repo: context.repo.repo,
               issue_number: context.issue.number,
               state: 'closed'
             });
