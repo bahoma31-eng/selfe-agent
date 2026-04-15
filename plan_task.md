@@ -21,7 +21,7 @@ email
 ## Phases
 - [ ] Phase 1: Import necessary libraries - Import smtplib library to send emails
 - [ ] Phase 2: Define email parameters - Define sender, receiver, subject, and body of the email
-- [ ] Phase 3: Send email using SMTP - Use smtplib to send the email to bahoma31@gmail.com
+- [ ] Phase 3: Send email using SMTP - Use smtplib to send the email with the defined parameters
 
 ## Success Criteria
 The email is delivered to bahoma31@gmail.com with the correct content
