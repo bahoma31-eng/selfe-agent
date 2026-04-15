@@ -1,187 +1,158 @@
 import os
 import json
 import subprocess
-import requests
+from datetime import datetime, timezone
 from groq import Groq
-from datetime import datetime
 
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
-GITHUB_REPOSITORY = os.environ.get('GITHUB_REPOSITORY', '')
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
-ISSUE_NUMBER = int(os.environ.get('ISSUE_NUMBER', 0))
+client = Groq(api_key=os.environ['GROQ_API_KEY'])
 
-def get_repo_structure():
-    """Scan the repository and return its structure."""
-    result = {}
-    ignore = {'.git', '__pycache__', 'node_modules', '.github'}
-    file_list = []
-    total_files = 0
-    total_lines = 0
-    languages = {}
+# ── تحويل نص المرحلة إلى أوامر حقيقية عبر LLM ────────────────────
+def generate_commands(phase_text: str, issue_context: str) -> list[str]:
+    prompt = f"""You are a Linux terminal command generator.
+Convert this task description into a list of exact shell commands to execute.
 
-    for root, dirs, files in os.walk('.'):
-        dirs[:] = [d for d in dirs if d not in ignore]
-        for f in files:
-            path = os.path.join(root, f).lstrip('./')
-            ext = os.path.splitext(f)[1]
-            size = 0
-            lines = 0
-            try:
-                full_path = os.path.join(root, f)
-                size = os.path.getsize(full_path)
-                if ext in ['.py', '.js', '.ts', '.yml', '.yaml', '.md', '.json', '.txt', '.sh']:
-                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as fh:
-                        lines = len(fh.readlines())
-                    total_lines += lines
-            except Exception:
-                pass
-            total_files += 1
-            lang = ext if ext else 'no-ext'
-            languages[lang] = languages.get(lang, 0) + 1
-            file_list.append({'path': path, 'size': size, 'lines': lines, 'ext': ext})
+Issue context: {issue_context}
+Task: {phase_text}
 
-    result['total_files'] = total_files
-    result['total_lines'] = total_lines
-    result['languages'] = languages
-    result['files'] = file_list
-    return result
+Rules:
+- Return ONLY a JSON array of shell command strings, nothing else.
+- Commands must be safe and executable in Ubuntu GitHub Actions environment.
+- Use pip, python, git, curl, mkdir, echo, etc.
+- If task is unclear or conceptual only, return ["echo 'Phase noted - no commands needed'"]
 
-def get_recent_commits():
-    """Get recent git commits."""
-    try:
-        out = subprocess.check_output(
-            ['git', 'log', '--oneline', '-10'],
-            stderr=subprocess.DEVNULL
-        ).decode('utf-8').strip()
-        return out
-    except Exception:
-        return 'No commits found'
-
-def get_plan_content():
-    """Read the plan_task.md file."""
-    try:
-        with open('plan_task.md', 'r', encoding='utf-8') as f:
-            return f.read()
-    except Exception:
-        return ''
-
-def mark_all_phases_done(plan_content):
-    """Mark all phases as done in plan_task.md."""
-    lines = plan_content.split('\n')
-    updated = []
-    for line in lines:
-        if line.strip().startswith('- [ ]'):
-            line = line.replace('- [ ]', '- [x]', 1)
-        updated.append(line)
-    result = '\n'.join(updated)
-    with open('plan_task.md', 'w', encoding='utf-8') as f:
-        f.write(result)
-    return result
-
-def analyze_with_groq(repo_structure, plan_content, commits):
-    """Use Groq AI to analyze the repo and produce a full report."""
-    client = Groq(api_key=GROQ_API_KEY)
-
-    # Build file tree summary
-    files_summary = '\n'.join([
-        f"  - {f['path']} ({f['lines']} lines)" if f['lines'] > 0 else f"  - {f['path']}"
-        for f in repo_structure['files'][:40]
-    ])
-    lang_summary = ', '.join([f"{k}: {v}" for k, v in sorted(repo_structure['languages'].items(), key=lambda x: -x[1])[:8]])
-
-    prompt = f"""You are an expert code analyst. Analyze this GitHub repository and produce a detailed technical report in Arabic.
-
-Repository Statistics:
-- Total Files: {repo_structure['total_files']}
-- Total Lines of Code: {repo_structure['total_lines']}
-- Languages/Extensions: {lang_summary}
-
-File Structure (first 40 files):
-{files_summary}
-
-Recent Commits:
-{commits}
-
-Task Plan:
-{plan_content}
-
-Write a comprehensive report in Arabic covering:
-1. نظرة عامة على المستودع
-2. هيكل المشروع والملفات الرئيسية
-3. اللغات والتقنيات المستخدمة
-4. تحليل الكود والوحدات الرئيسية
-5. جودة الكود والملاحظات
-6. التوصيات والاقتراحات للتحسين
-
-Format the report nicely with emojis and markdown headers."""
-
+Example output:
+["pip install requests", "python script.py", "echo done"]
+"""
     response = client.chat.completions.create(
-        model='llama-3.3-70b-versatile',
-        messages=[{'role': 'user', 'content': prompt}],
-        max_tokens=2000
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1
     )
-    return response.choices[0].message.content
 
-def post_comment_to_issue(comment_body):
-    """Post the report as a comment on the GitHub Issue."""
-    url = f'https://api.github.com/repos/{GITHUB_REPOSITORY}/issues/{ISSUE_NUMBER}/comments'
-    headers = {
-        'Authorization': f'token {GITHUB_TOKEN}',
-        'Accept': 'application/vnd.github.v3+json'
+    raw = response.choices[0].message.content.strip()
+
+    # استخراج JSON من الرد
+    import re
+    match = re.search(r'\[.*?\]', raw, re.DOTALL)
+    if match:
+        commands = json.loads(match.group())
+        return commands
+    return ['echo "Could not parse commands"']
+
+# ── إنشاء task_N.json ────────────────────────────────────────────
+def create_task_json(output_dir, issue_number, phase_index, phase_text, commands):
+    task = {
+        "issue_number": issue_number,
+        "phase": phase_index + 1,
+        "title": phase_text.split("—")[0].strip() if "—" in phase_text else phase_text[:50],
+        "description": phase_text,
+        "commands": commands,
+        "expected_output": "successful execution with returncode 0",
+        "status": "pending"
     }
-    data = {'body': comment_body}
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 201:
-        print(f'Comment posted successfully on Issue #{ISSUE_NUMBER}')
-    else:
-        print(f'Failed to post comment: {response.status_code} - {response.text}')
+    task_file = f"{output_dir}/task_{phase_index + 1}.json"
+    with open(task_file, 'w', encoding='utf-8') as f:
+        json.dump(task, f, indent=2, ensure_ascii=False)
+    return task_file
 
-def save_report(report):
-    """Save report to output folder."""
-    os.makedirs('selfe_notion_agent/output', exist_ok=True)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    path = f'selfe_notion_agent/output/report_issue_{ISSUE_NUMBER}_{ts}.md'
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(report)
-    print(f'Report saved to {path}')
-    return path
+# ── تنفيذ الأوامر وتسجيل النتائج ────────────────────────────────
+def execute_phase(issue_number, phase_index, phase_text, commands):
+    output_dir = f"output/issue_{issue_number}"
+    os.makedirs(output_dir, exist_ok=True)
 
-if __name__ == '__main__':
-    print(f'[Executor] Starting execution for Issue #{ISSUE_NUMBER}...')
+    # إنشاء task_N.json
+    create_task_json(output_dir, issue_number, phase_index, phase_text, commands)
 
-    # Step 1: Read plan
-    plan_content = get_plan_content()
-    print('[Executor] Plan loaded.')
+    log = {
+        "issue_number": issue_number,
+        "phase": phase_index + 1,
+        "description": phase_text,
+        "commands": commands,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "status": "running",
+        "stdout": "",
+        "stderr": "",
+        "verified": False,
+        "notes": ""
+    }
 
-    # Step 2: Scan repo
-    print('[Executor] Scanning repository structure...')
-    repo_structure = get_repo_structure()
-    print(f"[Executor] Found {repo_structure['total_files']} files, {repo_structure['total_lines']} lines of code.")
+    all_stdout = []
+    success = True
 
-    # Step 3: Get commits
-    commits = get_recent_commits()
-    print('[Executor] Fetched recent commits.')
+    for cmd in commands:
+        print(f"  ▶ Running: {cmd}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        all_stdout.append(f"$ {cmd}\n{result.stdout}")
 
-    # Step 4: Analyze with Groq AI
-    print('[Executor] Generating AI report with Groq...')
-    report = analyze_with_groq(repo_structure, plan_content, commits)
-    print('[Executor] Report generated.')
+        if result.returncode != 0:
+            success = False
+            log['stderr'] = result.stderr
+            log['notes'] = f"Failed at command: {cmd}"
+            break
 
-    # Step 5: Mark all phases as done
-    mark_all_phases_done(plan_content)
-    print('[Executor] All phases marked as done in plan_task.md.')
+    log['stdout'] = '\n'.join(all_stdout)
+    log['finished_at'] = datetime.now(timezone.utc).isoformat()
+    log['status'] = 'success' if success else 'failed'
+    log['verified'] = success
 
-    # Step 6: Save report
-    report_path = save_report(report)
+    log_file = f"{output_dir}/logging_{phase_index + 1}.json"
+    with open(log_file, 'w', encoding='utf-8') as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
 
-    # Step 7: Post report as comment on Issue
-    full_comment = f"""## 📊 تقرير تحليل المستودع - Issue #{ISSUE_NUMBER}
+    print(f"  {'✅' if success else '❌'} Phase {phase_index+1}: {log['status']}")
+    return success
 
-{report}
+# ── قراءة plan_task.md ────────────────────────────────────────────
+def parse_plan(plan_file: str):
+    with open(plan_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    phases = []
+    for line in content.split('\n'):
+        if line.strip().startswith('- [ ]'):
+            phases.append({'done': False, 'text': line.strip()[6:]})
+        elif line.strip().startswith('- [x]'):
+            phases.append({'done': True, 'text': line.strip()[6:]})
+    return phases
 
----
-*تم إنشاء هذا التقرير تلقائياً بواسطة **Selfe Notion Agent** باستخدام Groq AI*
-*📁 تم حفظ التقرير في: `{report_path}`*"""
+def mark_phase_done(plan_file: str, phase_index: int):
+    with open(plan_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    count = 0
+    lines = content.split('\n')
+    for i, line in enumerate(lines):
+        if line.strip().startswith('- [ ]'):
+            if count == phase_index:
+                lines[i] = lines[i].replace('- [ ]', '- [x]', 1)
+                break
+            count += 1
+    with open(plan_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
 
-    post_comment_to_issue(full_comment)
-    print('[Executor] Done! Report posted on Issue.')
+# ── الدخول الرئيسي ────────────────────────────────────────────────
+if __name__ == "__main__":
+    issue_number = int(os.environ['ISSUE_NUMBER'])
+    issue_context = os.environ.get('ISSUE_TITLE', '') + ': ' + os.environ.get('ISSUE_BODY', '')
+
+    phases = parse_plan('plan_task.md')
+    print(f"📋 Found {len(phases)} phases")
+
+    for i, phase in enumerate(phases):
+        if phase['done']:
+            print(f"⏭️  Phase {i+1} already done, skipping")
+            continue
+
+        print(f"\n🔄 Phase {i+1}: {phase['text'][:60]}...")
+
+        # تحويل النص الطبيعي → أوامر حقيقية
+        commands = generate_commands(phase['text'], issue_context)
+        print(f"  📦 Commands: {commands}")
+
+        success = execute_phase(issue_number, i, phase['text'], commands)
+
+        if success:
+            mark_phase_done('plan_task.md', i)  # ← [x] فقط عند النجاح
+        else:
+            print(f"\n🛑 Stopped at Phase {i+1} due to failure")
+            exit(1)
+
+    print("\n🎉 All phases completed!")
