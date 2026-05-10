@@ -1,7 +1,7 @@
-# Task Plan - Issue #20
+# Task Plan - Issue #8
 
 ## Summary
-Send an email to bahoma31@gmail.com stating that everything is alright
+The user wants to send an email to bahoma31@gmail.com
 
 ## Task Type
 email
@@ -19,7 +19,7 @@ email
 - SMTP_PASS
 
 ## Phases
-- [ ] Phase 1: Send Email - Use smtplib to send an email to bahoma31@gmail.com with the message 'كل شيء على ما يرام'
+- [ ] Phase 1: Send Email - Use smtplib to send an email to bahoma31@gmail.com
 
 ## Success Criteria
-The email is delivered to bahoma31@gmail.com with the correct message
+The email is delivered to bahoma31@gmail.com
